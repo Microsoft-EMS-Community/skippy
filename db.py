@@ -1,0 +1,492 @@
+# ============================================================
+# db.py - Database layer (aiosqlite, async)
+# Handles all SQLite interactions for follow-up tracking.
+# ============================================================
+
+import aiosqlite
+import datetime
+from config import DB_PATH
+
+
+async def init_db():
+    """Initialize the database and create tables if they don't exist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS follow_ups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT,
+                message_link TEXT,
+                question_snippet TEXT,
+                flagged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP,
+                resolver_id TEXT,
+                status TEXT DEFAULT 'open',
+                warning_sent INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS user_scores (
+                user_id TEXT PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                flag_count INTEGER DEFAULT 0,
+                resolved_count INTEGER DEFAULT 0,
+                ignored_count INTEGER DEFAULT 0,
+                last_flagged TIMESTAMP,
+                last_resolved TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                actor_id TEXT,
+                target_id TEXT,
+                detail TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS rss_watchlist (
+                user_id TEXT PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                added_by TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS rss_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                message_link TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await db.commit()
+
+
+# ──────────────────────────────────────────────
+# Follow-up CRUD
+# ──────────────────────────────────────────────
+
+async def add_follow_up(user_id: str, guild_id: str, channel_id: str,
+                         message_link: str, question_snippet: str) -> int:
+    """Insert a new open follow-up record. Returns the new row id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO follow_ups
+               (user_id, guild_id, channel_id, message_link, question_snippet)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, guild_id, channel_id, message_link, question_snippet)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_open_follow_ups(user_id: str) -> list[dict]:
+    """Return all open follow-up records for a given user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups WHERE user_id = ? AND status = 'open'",
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def resolve_follow_up(follow_up_id: int, resolver_id: str):
+    """Mark a specific follow-up as resolved."""
+    now = datetime.datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE follow_ups
+               SET status = 'resolved', resolved_at = ?, resolver_id = ?
+               WHERE id = ?""",
+            (now, resolver_id, follow_up_id)
+        )
+        await db.commit()
+
+
+async def resolve_all_open_follow_ups(user_id: str, resolver_id: str):
+    """Mark ALL open follow-ups for a user as resolved (e.g., on role removal)."""
+    now = datetime.datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE follow_ups
+               SET status = 'resolved', resolved_at = ?, resolver_id = ?
+               WHERE user_id = ? AND status = 'open'""",
+            (now, resolver_id, user_id)
+        )
+        await db.commit()
+
+
+async def get_overdue_follow_ups(hours: int) -> list[dict]:
+    """Return open follow-ups older than `hours` hours (for warning tasks)."""
+    cutoff = (datetime.datetime.utcnow() -
+              datetime.timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM follow_ups
+               WHERE status = 'open' AND flagged_at < ?""",
+            (cutoff,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def mark_warning_sent(follow_up_id: int):
+    """Set warning_sent = 1 for a follow-up so we don't re-warn."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE follow_ups SET warning_sent = 1 WHERE id = ?",
+            (follow_up_id,)
+        )
+        await db.commit()
+
+
+async def mark_ignored(follow_up_id: int):
+    """Mark a follow-up as ignored (>7 days with no response)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE follow_ups SET status = 'ignored' WHERE id = ?",
+            (follow_up_id,)
+        )
+        await db.commit()
+
+
+async def mark_left_server(user_id: str):
+    """Mark all open follow-ups as 'left_server' when a user leaves."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE follow_ups SET status = 'left_server' WHERE user_id = ? AND status = 'open'",
+            (user_id,)
+        )
+        await db.commit()
+
+
+async def get_left_server_follow_ups(user_id: str) -> list[dict]:
+    """Return follow-ups marked left_server (for when a user rejoins)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups WHERE user_id = ? AND status = 'left_server'",
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────
+# User Scores
+# ──────────────────────────────────────────────
+
+async def increment_flag_count(user_id: str, guild_id: str):
+    """Upsert user_scores row and bump flag_count."""
+    now = datetime.datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO user_scores (user_id, guild_id, flag_count, last_flagged)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   flag_count = flag_count + 1,
+                   last_flagged = excluded.last_flagged""",
+            (user_id, guild_id, now)
+        )
+        await db.commit()
+
+
+async def increment_resolved_count(user_id: str):
+    """Bump resolved_count for a user."""
+    now = datetime.datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE user_scores
+               SET resolved_count = resolved_count + 1, last_resolved = ?
+               WHERE user_id = ?""",
+            (now, user_id)
+        )
+        await db.commit()
+
+
+async def increment_ignored_count(user_id: str):
+    """Bump ignored_count for a user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE user_scores SET ignored_count = ignored_count + 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        await db.commit()
+
+
+async def get_user_score(user_id: str) -> dict | None:
+    """Return the user_scores row for a user, or None if not found."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM user_scores WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_avg_resolution_time(user_id: str) -> float | None:
+    """Calculate average resolution time in hours for a user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT AVG(
+                   (julianday(resolved_at) - julianday(flagged_at)) * 24
+               ) as avg_hours
+               FROM follow_ups
+               WHERE user_id = ? AND status = 'resolved'
+                 AND resolved_at IS NOT NULL""",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row and row[0] is not None else None
+
+
+# ──────────────────────────────────────────────
+# Audit Log
+# ──────────────────────────────────────────────
+
+async def add_audit_log(action: str, actor_id: str | None,
+                         target_id: str | None, detail: str | None):
+    """Append an entry to the audit log."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO audit_log (action, actor_id, target_id, detail)
+               VALUES (?, ?, ?, ?)""",
+            (action, actor_id, target_id, detail)
+        )
+        await db.commit()
+
+
+async def get_recent_audit_log(limit: int = 10) -> list[dict]:
+    """Return the most recent `limit` audit log entries."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ──────────────────────────────────────────────
+# Server-wide Stats
+# ──────────────────────────────────────────────
+
+async def get_server_stats(guild_id: str) -> dict:
+    """Return server-wide follow-up statistics for /stats command."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Overall counts
+        cursor = await db.execute(
+            "SELECT COUNT(*) as total FROM follow_ups WHERE guild_id = ?", (guild_id,)
+        )
+        total = (await cursor.fetchone())["total"]
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) as c FROM follow_ups WHERE guild_id = ? AND status = 'open'", (guild_id,)
+        )
+        open_count = (await cursor.fetchone())["c"]
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) as c FROM follow_ups WHERE guild_id = ? AND status = 'resolved'", (guild_id,)
+        )
+        resolved_count = (await cursor.fetchone())["c"]
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) as c FROM follow_ups WHERE guild_id = ? AND status = 'ignored'", (guild_id,)
+        )
+        ignored_count = (await cursor.fetchone())["c"]
+
+        # Average resolution time across all resolved follow-ups
+        cursor = await db.execute(
+            """SELECT AVG((julianday(resolved_at) - julianday(flagged_at)) * 24) as avg_hours
+               FROM follow_ups
+               WHERE guild_id = ? AND status = 'resolved' AND resolved_at IS NOT NULL""",
+            (guild_id,)
+        )
+        row = await cursor.fetchone()
+        avg_hours = row["avg_hours"] if row and row["avg_hours"] is not None else None
+
+        # Top 5 most flagged users
+        cursor = await db.execute(
+            """SELECT user_id, flag_count FROM user_scores
+               WHERE guild_id = ? ORDER BY flag_count DESC LIMIT 5""",
+            (guild_id,)
+        )
+        top_flagged = [dict(r) for r in await cursor.fetchall()]
+
+        # Top 5 most active helpers (by unmark/flag actions in audit log)
+        cursor = await db.execute(
+            """SELECT actor_id, COUNT(*) as actions FROM audit_log
+               WHERE action IN ('flagged_via_reaction', 'flagged_via_command', 'unmark', 'unmark_button')
+               AND actor_id IS NOT NULL
+               GROUP BY actor_id ORDER BY actions DESC LIMIT 5""",
+        )
+        top_helpers = [dict(r) for r in await cursor.fetchall()]
+
+        return {
+            "total": total,
+            "open": open_count,
+            "resolved": resolved_count,
+            "ignored": ignored_count,
+            "avg_hours": avg_hours,
+            "top_flagged": top_flagged,
+            "top_helpers": top_helpers,
+        }
+
+
+# ──────────────────────────────────────────────
+# Cleanup
+# ──────────────────────────────────────────────
+
+async def cleanup_old_records(
+    audit_log_days: int = 90,
+    follow_up_days: int = 180
+) -> dict:
+    """
+    Prune old records to keep the DB lean.
+    - audit_log: delete entries older than audit_log_days
+    - follow_ups: delete resolved/ignored rows older than follow_up_days
+    - user_scores: never touched (reputation data kept forever)
+    Returns counts of deleted rows.
+    """
+    audit_cutoff = (
+        datetime.datetime.utcnow() - datetime.timedelta(days=audit_log_days)
+    ).isoformat()
+    followup_cutoff = (
+        datetime.datetime.utcnow() - datetime.timedelta(days=follow_up_days)
+    ).isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM audit_log WHERE timestamp < ?",
+            (audit_cutoff,)
+        )
+        deleted_audit = cursor.rowcount
+
+        cursor = await db.execute(
+            """DELETE FROM follow_ups
+               WHERE status IN ('resolved', 'ignored', 'left_server')
+               AND flagged_at < ?""",
+            (followup_cutoff,)
+        )
+        deleted_followups = cursor.rowcount
+
+        await db.commit()
+
+    return {"audit_log": deleted_audit, "follow_ups": deleted_followups}
+
+
+# ──────────────────────────────────────────────
+# RSS Watchlist
+# ──────────────────────────────────────────────
+
+async def add_to_watchlist(user_id: str, guild_id: str, added_by: str):
+    """Upsert a user into the RSS watchlist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO rss_watchlist (user_id, guild_id, added_by)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET added_by=excluded.added_by, added_at=CURRENT_TIMESTAMP""",
+            (user_id, guild_id, added_by)
+        )
+        await db.commit()
+
+
+async def remove_from_watchlist(user_id: str):
+    """Remove a user from the RSS watchlist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM rss_watchlist WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+async def get_watchlist(guild_id: str) -> list[dict]:
+    """Return all watched users for a guild."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM rss_watchlist WHERE guild_id = ? ORDER BY added_at ASC",
+            (guild_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def is_watched(user_id: str) -> bool:
+    """Return True if the user is on the watchlist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM rss_watchlist WHERE user_id = ? LIMIT 1", (user_id,)
+        )
+        return await cursor.fetchone() is not None
+
+
+async def log_rss_activity(user_id: str, guild_id: str, channel_id: str,
+                            message_id: str, message_link: str):
+    """Record a message from a watched user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO rss_activity (user_id, guild_id, channel_id, message_id, message_link)
+               VALUES (?, ?, ?, ?, ?)""",
+            (user_id, guild_id, channel_id, message_id, message_link)
+        )
+        await db.commit()
+
+
+async def get_rss_activity(user_id: str, days: int = 30) -> list[dict]:
+    """Return all activity rows for a user within the last N days."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM rss_activity
+               WHERE user_id = ? AND sent_at >= ?
+               ORDER BY sent_at DESC""",
+            (user_id, cutoff)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_rss_activity_count(user_id: str, days: int = 30) -> int:
+    """Return message count for a user in the last N days."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM rss_activity WHERE user_id = ? AND sent_at >= ?",
+            (user_id, cutoff)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_latest_rss_message(user_id: str) -> dict | None:
+    """Return the most recent activity row for a user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM rss_activity WHERE user_id = ?
+               ORDER BY sent_at DESC LIMIT 1""",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def cleanup_rss_activity(days: int = 30) -> int:
+    """Delete rss_activity rows older than N days. Returns count deleted."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM rss_activity WHERE sent_at < ?", (cutoff,)
+        )
+        await db.commit()
+        return cursor.rowcount
