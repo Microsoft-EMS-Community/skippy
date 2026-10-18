@@ -136,6 +136,7 @@ async def init_db():
             "summary_after": "INTEGER NOT NULL DEFAULT 5",
             "author_id": "TEXT",
             "activity_exempt": "INTEGER NOT NULL DEFAULT 0",
+            "display_name": "TEXT",
         })
         await db.commit()
 
@@ -675,7 +676,7 @@ async def record_feed_check(feed_id: int, error: str | None, etag: str | None = 
 
 
 FEED_SETTINGS = ("channel_id", "role_id", "include_words", "exclude_words",
-                 "highlight_words", "summary_after", "author_id", "activity_exempt")
+                 "highlight_words", "summary_after", "author_id", "activity_exempt", "display_name")
 
 
 async def update_feed(feed_id: int, guild_id: str, **settings) -> bool:

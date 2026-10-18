@@ -106,10 +106,17 @@ DEFAULT_CHANNEL_ID = next(iter(FEED_CHANNELS.values()))
 CLEARABLE_SETTINGS = [
     app_commands.Choice(name="role ping", value="role_id"),
     app_commands.Choice(name="author", value="author_id"),
+    app_commands.Choice(name="name (use the feed's own title)", value="display_name"),
     app_commands.Choice(name="include words", value="include_words"),
     app_commands.Choice(name="exclude words", value="exclude_words"),
     app_commands.Choice(name="highlight words", value="highlight_words"),
 ]
+
+
+def feed_name(feed: dict, fresh_title: str | None = None) -> str:
+    """What posts and messages call a feed: the name mods gave it, else the
+    title the feed gives itself (fresh_title, if just fetched), else its URL."""
+    return feed.get("display_name") or fresh_title or feed["title"] or feed["url"]
 
 
 def is_mod(member) -> bool:
@@ -234,12 +241,15 @@ class FeedCommands(commands.Cog):
     @app_commands.describe(url="The RSS or Atom feed URL",
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
                            role="Optional role to ping with every post",
-                           author="The member who writes it: credited and pinged on posts, and activity-tracked")
+                           author="The member who writes it: credited and pinged on posts, and activity-tracked",
+                           name="What posts call it, if the feed's own title isn't good (e.g. just \"Blog\")")
     @app_commands.choices(channel=CHANNEL_CHOICES)
     @is_rss_admin()
     async def feed_add(self, interaction: discord.Interaction, url: str, channel: str | None = None,
-                       role: discord.Role | None = None, author: discord.Member | None = None):
+                       role: discord.Role | None = None, author: discord.Member | None = None,
+                       name: app_commands.Range[str, 1, 80] | None = None):
         await interaction.response.defer(ephemeral=True)
+        url = feed_reader.normalize_url(url)
         try:
             feed_id, title, items, target = await self._create_feed(
                 interaction.guild, url, int(channel) if channel else DEFAULT_CHANNEL_ID,
@@ -257,17 +267,19 @@ class FeedCommands(commands.Cog):
                          "so posts will show the role without pinging anyone.")
         if author:
             notes.append(f"\n👤 Posts credit {author.mention}, who's now on the RSS watchlist.")
+        if name and name.strip():
+            await db.update_feed(feed_id, str(interaction.guild_id), display_name=name.strip())
+        row = await db.get_feed(feed_id, str(interaction.guild_id))
         newest = feed_reader.select_new(items, set(), 1)
         if newest:
             # The newest item as a real post (archived, credited, threaded),
             # just without pings: a visible sign the feed is connected.
-            row = await db.get_feed(feed_id, str(interaction.guild_id))
-            if await self._post(target, row, title, newest, ping=False):
+            if await self._post(target, row, feed_name(row, title), newest, ping=False):
                 notes.append(f"\n📮 Posted its newest item in {target.mention}.")
             else:
                 notes.append("\n⚠️ Couldn't post its newest item; see the bot's log.")
         await interaction.followup.send(
-            f"✅ Added feed #{feed_id} **{discord.utils.escape_markdown(title or url)}** → {target.mention}. "
+            f"✅ Added feed #{feed_id} **{discord.utils.escape_markdown(feed_name(row, title))}** → {target.mention}. "
             f"Its {len(items)} current items are skipped; new ones are posted within {FEED_POLL_MINUTES} minutes. "
             f"Preview the format with `/feed test feed:{feed_id}`, and set filters with `/feed edit`."
             + "".join(notes),
@@ -283,7 +295,7 @@ class FeedCommands(commands.Cog):
             await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"🗑️ Removed feed #{feed} **{discord.utils.escape_markdown(row['title'] or row['url'])}**.",
+            f"🗑️ Removed feed #{feed} **{discord.utils.escape_markdown(feed_name(row))}**.",
             ephemeral=True)
         logger.info("Feed #%s removed by %s", feed, interaction.user)
 
@@ -303,7 +315,7 @@ class FeedCommands(commands.Cog):
             if f["author_id"] and mode != "off" and not f["activity_exempt"]:
                 author += " " + ACTIVITY_BADGES[(await self._author_status(f["author_id"], min_messages))[0]]
             filters = " · 🔎 filtered" if f["include_words"] or f["exclude_words"] else ""
-            name = discord.utils.escape_markdown(f["title"] or f["url"])
+            name = discord.utils.escape_markdown(feed_name(f))
             lines.append(f"`#{f['id']}` **{name}** → <#{f['channel_id']}>{author}{role}{filters} · {status}")
         embed = discord.Embed(title="📰 Feeds", description="\n".join(lines)[:4000], color=discord.Color.blurple())
         embed.set_footer(text=f"{len(feeds)} feed(s) · checked every {FEED_POLL_MINUTES} minutes · "
@@ -316,6 +328,7 @@ class FeedCommands(commands.Cog):
         channel="Move it to another feed channel",
         role="Role to ping with every post",
         author="The member who writes it: credited and pinged on posts, and activity-tracked",
+        name="What posts call it, instead of the feed's own title",
         include="Only post titles mentioning one of these words (comma-separated)",
         exclude="Never post titles mentioning any of these words (comma-separated)",
         highlight="In summaries, list titles mentioning these first, in bold (comma-separated)",
@@ -326,6 +339,7 @@ class FeedCommands(commands.Cog):
     @is_rss_admin()
     async def feed_edit(self, interaction: discord.Interaction, feed: int, channel: str | None = None,
                         role: discord.Role | None = None, author: discord.Member | None = None,
+                        name: app_commands.Range[str, 1, 80] | None = None,
                         include: str | None = None, exclude: str | None = None,
                         highlight: str | None = None,
                         summary_after: app_commands.Range[int, 1, 25] | None = None,
@@ -342,10 +356,12 @@ class FeedCommands(commands.Cog):
             changes["channel_id"] = channel
         if role:
             changes["role_id"] = str(role.id)
-        for name, value in (("include_words", include), ("exclude_words", exclude),
-                            ("highlight_words", highlight)):
+        if name and name.strip():
+            changes["display_name"] = name.strip()
+        for setting, value in (("include_words", include), ("exclude_words", exclude),
+                               ("highlight_words", highlight)):
             if value is not None:
-                changes[name] = ", ".join(feed_reader.word_list(value)) or None
+                changes[setting] = ", ".join(feed_reader.word_list(value)) or None
         if summary_after:
             changes["summary_after"] = summary_after
         if activity_exempt is not None:
@@ -394,6 +410,7 @@ class FeedCommands(commands.Cog):
     async def feed_suggest(self, interaction: discord.Interaction, url: str, own_blog: bool = True,
                            note: app_commands.Range[str, 1, 300] | None = None):
         await interaction.response.defer(ephemeral=True)
+        url = feed_reader.normalize_url(url)
         guild_id, member_id = str(interaction.guild_id), str(interaction.user.id)
         if await db.feed_url_tracked(guild_id, url):
             await interaction.followup.send("That feed is already in the content tracker. 🎉", ephemeral=True)
@@ -468,7 +485,8 @@ class FeedCommands(commands.Cog):
         credit = f", credited to <@{author_id}>" if author_id else ""
         newest = feed_reader.select_new(items, set(), 1)
         if newest:  # welcome the blog with its newest article, which also shows the feed works
-            await self._post(channel, await db.get_feed(feed_id, str(interaction.guild_id)), title, newest, ping=False)
+            row = await db.get_feed(feed_id, str(interaction.guild_id))
+            await self._post(channel, row, feed_name(row, title), newest, ping=False)
         await self._close_card(interaction.message, discord.Color.green(),
                                f"✅ Approved by {interaction.user.mention}: feed #{feed_id} → {channel.mention}{credit}")
         await self._dm(suggestion["suggested_by"],
@@ -533,7 +551,7 @@ class FeedCommands(commands.Cog):
             await interaction.followup.send("The feed has no items right now.", ephemeral=True)
             return
         # The test post shows the author credit but never pings anyone.
-        await channel.send(feed_reader.format_post(title or row["title"], newest[0], author_id=row["author_id"]),
+        await channel.send(feed_reader.format_post(feed_name(row, title), newest[0], author_id=row["author_id"]),
                            allowed_mentions=discord.AllowedMentions.none())
         await interaction.followup.send(f"Posted the newest item in {channel.mention}.", ephemeral=True)
 
@@ -543,7 +561,7 @@ class FeedCommands(commands.Cog):
     async def _feed_choices(self, interaction: discord.Interaction, current: str):
         choices = []
         for f in await db.get_feeds(str(interaction.guild_id)):
-            label = f"#{f['id']} {f['title'] or f['url']}"
+            label = f"#{f['id']} {feed_name(f)}"
             if current.lower() in label.lower():
                 choices.append(app_commands.Choice(name=label[:100], value=f["id"]))
         return choices[:25]
@@ -606,7 +624,7 @@ class FeedCommands(commands.Cog):
         # While the author's posts are paused, new items are skipped, not
         # saved up: coming back doesn't flood the channel with old posts.
         to_post = [] if held else [i for i in new if feed_reader.wanted(i, include, exclude)]
-        posted = await self._post(channel, feed, title or feed["title"], to_post)
+        posted = await self._post(channel, feed, feed_name(feed, title), to_post)
         # Filtered-out items are marked seen (skipped for good). Wanted items
         # that didn't make it to Discord stay unseen, so the next check retries.
         unposted = {i.key for i in to_post} - posted
@@ -886,7 +904,9 @@ class FeedCommands(commands.Cog):
         role = f"<@&{feed['role_id']}>" if feed["role_id"] else none
         author = f"<@{feed['author_id']}>" if feed["author_id"] else none
         return "\n".join([
-            f"**{discord.utils.escape_markdown(feed['title'] or feed['url'])}** <{feed['url']}>",
+            f"**{discord.utils.escape_markdown(feed_name(feed))}** <{feed['url']}>"
+            + (f" (the feed calls itself \"{discord.utils.escape_markdown(feed['title'])}\")"
+               if feed["display_name"] and feed["title"] and feed["title"] != feed["display_name"] else ""),
             f"Channel: <#{feed['channel_id']}>",
             f"Ping role: {role}",
             f"Author: {author}",
@@ -911,7 +931,7 @@ class FeedCommands(commands.Cog):
 
     @staticmethod
     def _name(feed: dict) -> str:
-        return discord.utils.escape_markdown(feed["title"] or feed["url"])
+        return discord.utils.escape_markdown(feed_name(feed))
 
 
 async def setup(bot: commands.Bot):

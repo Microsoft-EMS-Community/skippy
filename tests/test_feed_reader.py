@@ -130,6 +130,13 @@ class SelectAndFormatTests(unittest.TestCase):
         listed = sum(p.count("\n• ") + p.startswith("• ") for p in parts)
         self.assertTrue(parts[1].endswith(f"…and {200 - listed} more."))
 
+    def test_pasted_urls_are_cleaned_up(self):
+        want = "https://cirriustech.co.uk/blog/index.xml"
+        for pasted in (want, f"  {want}  ", f"<{want}>", f"\u200b{want}\u200b", f'"{want}"',
+                       "cirriustech.co.uk/blog/index.xml", f"\ufeff<{want}>\n"):
+            self.assertEqual(feed_reader.normalize_url(pasted), want, repr(pasted))
+        self.assertEqual(feed_reader.normalize_url("http://e.com/rss"), "http://e.com/rss")  # http stays http
+
 
 class FetchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
