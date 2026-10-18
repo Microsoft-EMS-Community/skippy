@@ -6,7 +6,7 @@ import asyncio
 import ipaddress
 import re
 import socket
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, unquote_plus
 
 import aiohttp
 
@@ -85,8 +85,13 @@ DOMAIN_TRACKING_PARAMS = {
     "x.com": {"s", "t"},
     "reddit.com": {"share_id", "context"},
     "google.": {"ved", "uact", "sa", "source", "ei", "gs_lcp", "gs_lp",
-                "oq", "aqs", "sourceid", "ie", "sxsrf", "sca_esv", "gs_ssp"},
-    "linkedin.com": {"rcm", "midtoken", "midsig", "trkemail"},
+                "oq", "aqs", "sourceid", "ie", "sxsrf", "sca_esv", "gs_ssp",
+                # Google Maps app share links
+                "entry", "coh", "g_ep", "skid", "g_st"},
+    "linkedin.com": {"rcm", "midtoken", "midsig", "trkemail",
+                     "highlightedupdateurn", "highlightedupdatetype", "origin",
+                     "lipi", "licu", "trackingid", "refid",
+                     "originalsubdomain", "original_referer"},
     "youtube.com": {"feature"},
     "youtu.be": {"feature"},
     "hotels.com": {"x_pwa", "rfrr", "pwa_ts", "referrerUrl", "searchId", "userIntent"},
@@ -107,10 +112,13 @@ def _domain_extra_params(netloc: str) -> set[str]:
 
 
 def _clean_query(query: str, extra_params: set[str]) -> str:
+    # Filter the raw "key=value" segments instead of decoding and re-encoding
+    # the query, so kept params keep their exact original encoding. Re-encoding
+    # rewrites characters like "," or ":" and made untouched URLs look cleaned.
     drop = {p.lower() for p in TRACKING_PARAMS | extra_params}
-    kept = [(k, val) for k, val in parse_qsl(query, keep_blank_values=True)
-            if k.lower() not in drop]
-    return urlencode(kept)
+    kept = [seg for seg in query.split("&")
+            if unquote_plus(seg.split("=", 1)[0]).lower() not in drop]
+    return "&".join(kept)
 
 
 def clean_url(url: str) -> str:
@@ -125,9 +133,10 @@ def clean_url(url: str) -> str:
 
     path = parts.path
     new_query = parts.query
-    # Amazon product links: everything past /dp/ASIN or /gp/product/ASIN is tracking cruft
+    # Amazon product links: only /dp/ASIN or /gp/product/ASIN matters. The
+    # product-name slug before it and everything after it (/ref=...) is cruft.
     if "amazon." in parts.netloc.lower():
-        m = re.match(r"(/(?:[a-z]{2}/)?(?:dp|gp/product)/[A-Z0-9]{10})(?:/.*)?$", path)
+        m = re.search(r"((?:/[a-z]{2})?/(?:dp|gp/product)/[A-Z0-9]{10})(?:/|$)", path)
         if m:
             path = m.group(1)
     if parts.query:
