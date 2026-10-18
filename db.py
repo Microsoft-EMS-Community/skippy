@@ -85,8 +85,35 @@ async def init_db():
                 seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (feed_id, item_key)
             );
+
+            CREATE TABLE IF NOT EXISTS feed_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feed_id INTEGER NOT NULL,
+                feed_title TEXT,
+                title TEXT NOT NULL,
+                link TEXT NOT NULL,
+                message_url TEXT,
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS feed_posts_posted_at ON feed_posts (posted_at);
         """)
+        # Columns added after the feeds table first shipped; add them to
+        # databases created before that.
+        await _add_missing_columns(db, "feeds", {
+            "include_words": "TEXT",
+            "exclude_words": "TEXT",
+            "highlight_words": "TEXT",
+            "summary_after": "INTEGER NOT NULL DEFAULT 5",
+        })
         await db.commit()
+
+
+async def _add_missing_columns(db, table: str, columns: dict[str, str]):
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in await cursor.fetchall()}
+    for name, definition in columns.items():
+        if name not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 # ──────────────────────────────────────────────
@@ -613,3 +640,55 @@ async def record_feed_check(feed_id: int, error: str | None, etag: str | None = 
         cursor = await db.execute("SELECT failures FROM feeds WHERE id = ?", (feed_id,))
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+
+FEED_SETTINGS = ("channel_id", "role_id", "include_words", "exclude_words",
+                 "highlight_words", "summary_after")
+
+
+async def update_feed(feed_id: int, guild_id: str, **settings) -> bool:
+    """Change a feed's settings (any of FEED_SETTINGS; None clears a text
+    setting). Returns False if the feed doesn't exist."""
+    unknown = set(settings) - set(FEED_SETTINGS)
+    if unknown:
+        raise ValueError(f"not feed settings: {unknown}")
+    if not settings:
+        return await get_feed(feed_id, guild_id) is not None
+    assignments = ", ".join(f"{name} = ?" for name in settings)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"UPDATE feeds SET {assignments} WHERE id = ? AND guild_id = ?",
+            (*settings.values(), feed_id, guild_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def archive_feed_posts(rows: list[tuple]):
+    """rows: (feed_id, feed_title, title, link, message_url)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """INSERT INTO feed_posts (feed_id, feed_title, title, link, message_url)
+               VALUES (?, ?, ?, ?, ?)""",
+            rows
+        )
+        await db.commit()
+
+
+async def search_feed_posts(words: list[str], limit: int = 10) -> list[dict]:
+    """Newest posted items whose title or feed name contains every word."""
+    if not words:
+        return []
+    conditions = " AND ".join(
+        "(title LIKE ? ESCAPE '\\' OR feed_title LIKE ? ESCAPE '\\')" for _ in words)
+    params = []
+    for word in words:
+        pattern = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        params += [pattern, pattern]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            f"SELECT * FROM feed_posts WHERE {conditions} ORDER BY posted_at DESC, id DESC LIMIT ?",
+            (*params, limit)
+        )
+        return [dict(r) for r in await cursor.fetchall()]

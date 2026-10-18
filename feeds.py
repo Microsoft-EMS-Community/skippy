@@ -7,6 +7,7 @@ import asyncio
 import logging
 import sqlite3
 import time
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -20,9 +21,18 @@ from feed_reader import FeedError, RateLimited
 
 logger = logging.getLogger("followup-bot")
 
-MAX_POSTS_PER_CHECK = 5   # a feed that suddenly republishes everything can't flood a channel
 ALERT_AFTER_FAILURES = max(1, 60 // FEED_POLL_MINUTES)  # an hour of failed checks
 CONCURRENT_CHECKS = 5     # feeds checked at once, so slow or dead ones can't hold up the rest
+
+# A fixed list, not any channel: feeds only ever post where they're meant to.
+# Values are strings because channel IDs are too big for Discord's integers.
+CHANNEL_CHOICES = [app_commands.Choice(name=name, value=str(cid)) for name, cid in FEED_CHANNELS.items()]
+CLEARABLE_SETTINGS = [
+    app_commands.Choice(name="role ping", value="role_id"),
+    app_commands.Choice(name="include words", value="include_words"),
+    app_commands.Choice(name="exclude words", value="exclude_words"),
+    app_commands.Choice(name="highlight words", value="highlight_words"),
+]
 
 
 class FeedCommands(commands.Cog):
@@ -57,10 +67,7 @@ class FeedCommands(commands.Cog):
     @app_commands.describe(url="The RSS or Atom feed URL",
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
                            role="Optional role to ping with every post")
-    # A fixed list, not any channel: feeds only ever post where they're meant to.
-    # Values are strings because channel IDs are too big for Discord's integers.
-    @app_commands.choices(channel=[app_commands.Choice(name=name, value=str(cid))
-                                   for name, cid in FEED_CHANNELS.items()])
+    @app_commands.choices(channel=CHANNEL_CHOICES)
     @is_rss_admin()
     async def feed_add(self, interaction: discord.Interaction, url: str,
                        channel: str | None = None, role: discord.Role | None = None):
@@ -105,7 +112,8 @@ class FeedCommands(commands.Cog):
         await interaction.followup.send(
             f"✅ Added feed #{feed_id} **{discord.utils.escape_markdown(title or url)}** → {channel.mention}. "
             f"Its {len(items)} current items are skipped; new ones are posted within {FEED_POLL_MINUTES} minutes. "
-            f"Preview the format with `/feed test feed:{feed_id}`." + "".join(notes),
+            f"Preview the format with `/feed test feed:{feed_id}`, and set filters with `/feed edit`."
+            + "".join(notes),
             ephemeral=True)
         logger.info("Feed #%s added by %s: %s -> #%s", feed_id, interaction.user, url, channel)
 
@@ -133,10 +141,77 @@ class FeedCommands(commands.Cog):
         for f in feeds:
             status = f"⚠️ failing: {f['last_error']}" if f["failures"] else "✅"
             role = f" · pings <@&{f['role_id']}>" if f["role_id"] else ""
+            filters = " · 🔎 filtered" if f["include_words"] or f["exclude_words"] else ""
             name = discord.utils.escape_markdown(f["title"] or f["url"])
-            lines.append(f"`#{f['id']}` **{name}** → <#{f['channel_id']}>{role} · {status}")
+            lines.append(f"`#{f['id']}` **{name}** → <#{f['channel_id']}>{role}{filters} · {status}")
         embed = discord.Embed(title="📰 Feeds", description="\n".join(lines)[:4000], color=discord.Color.blurple())
-        embed.set_footer(text=f"{len(feeds)} feed(s) · checked every {FEED_POLL_MINUTES} minutes")
+        embed.set_footer(text=f"{len(feeds)} feed(s) · checked every {FEED_POLL_MINUTES} minutes · "
+                              "details: /feed edit")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @feed.command(name="edit", description="Change a feed's settings. With only a feed picked, shows them.")
+    @app_commands.describe(
+        feed="The feed to change",
+        channel="Move it to another feed channel",
+        role="Role to ping with every post",
+        include="Only post titles mentioning one of these words (comma-separated)",
+        exclude="Never post titles mentioning any of these words (comma-separated)",
+        highlight="In summaries, list titles mentioning these first, in bold (comma-separated)",
+        summary_after="More new posts than this at once become one summary post (default 5)",
+        clear="Remove one setting")
+    @app_commands.choices(channel=CHANNEL_CHOICES, clear=CLEARABLE_SETTINGS)
+    @is_rss_admin()
+    async def feed_edit(self, interaction: discord.Interaction, feed: int, channel: str | None = None,
+                        role: discord.Role | None = None, include: str | None = None,
+                        exclude: str | None = None, highlight: str | None = None,
+                        summary_after: app_commands.Range[int, 1, 25] | None = None,
+                        clear: str | None = None):
+        guild_id = str(interaction.guild_id)
+        if not await db.get_feed(feed, guild_id):
+            await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
+            return
+        changes = {}
+        if channel:
+            if int(channel) not in FEED_CHANNELS.values():
+                await interaction.response.send_message("That isn't one of the feed channels.", ephemeral=True)
+                return
+            changes["channel_id"] = channel
+        if role:
+            changes["role_id"] = str(role.id)
+        for name, value in (("include_words", include), ("exclude_words", exclude),
+                            ("highlight_words", highlight)):
+            if value is not None:
+                changes[name] = ", ".join(feed_reader.word_list(value)) or None
+        if summary_after:
+            changes["summary_after"] = summary_after
+        if clear:
+            changes[clear] = None
+        try:
+            await db.update_feed(feed, guild_id, **changes)
+        except sqlite3.IntegrityError:
+            await interaction.response.send_message("That feed already posts in that channel.", ephemeral=True)
+            return
+        row = await db.get_feed(feed, guild_id)
+        verb = "Updated" if changes else "Settings for"
+        await interaction.response.send_message(f"{verb} feed #{feed}:\n{self._describe(row)}", ephemeral=True)
+        if changes:
+            logger.info("Feed #%s edited by %s: %s", feed, interaction.user, changes)
+
+    @feed.command(name="search", description="Search everything the feeds have posted.")
+    @app_commands.describe(words="Words to look for in post titles and feed names")
+    async def feed_search(self, interaction: discord.Interaction, words: app_commands.Range[str, 2, 100]):
+        results = await db.search_feed_posts(words.split()[:5])
+        if not results:
+            await interaction.response.send_message(f"Nothing posted matches **{discord.utils.escape_markdown(words)}**.",
+                                                    ephemeral=True)
+            return
+        lines = []
+        for r in results:
+            when = int(datetime.fromisoformat(r["posted_at"]).replace(tzinfo=timezone.utc).timestamp())
+            title = discord.utils.escape_markdown(r["title"]).replace("[", "(").replace("]", ")")
+            lines.append(f"• [{title}](<{r['link']}>) · {discord.utils.escape_markdown(r['feed_title'] or '')} · <t:{when}:d>")
+        embed = discord.Embed(title=f"🔎 {words}"[:256], description="\n".join(lines)[:4000], color=discord.Color.blurple())
+        embed.set_footer(text=f"Newest {len(results)} match(es)")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @feed.command(name="test", description="Post a feed's newest item now, to check how posts look.")
@@ -165,6 +240,7 @@ class FeedCommands(commands.Cog):
         await interaction.followup.send(f"Posted the newest item in {channel.mention}.", ephemeral=True)
 
     @feed_remove.autocomplete("feed")
+    @feed_edit.autocomplete("feed")
     @feed_test.autocomplete("feed")
     async def _feed_choices(self, interaction: discord.Interaction, current: str):
         choices = []
@@ -225,25 +301,65 @@ class FeedCommands(commands.Cog):
             return
 
         seen = await db.get_seen_feed_items(feed["id"])
-        new = feed_reader.select_new(items, seen, MAX_POSTS_PER_CHECK)
-        unposted = {i.key for i in new}
-        role_id = feed["role_id"]
-        mentions = discord.AllowedMentions(everyone=False, users=False,
-                                           roles=[discord.Object(int(role_id))] if role_id else False)
-        for item in new:
-            try:
-                await channel.send(feed_reader.format_post(title or feed["title"], item, role_id),
-                                   allowed_mentions=mentions)
-            except discord.HTTPException as e:
-                logger.warning("Feed #%s: posting failed, retrying next check: %s", feed["id"], e)
-                break
-            unposted.discard(item.key)
-        # Unposted new items stay unseen so the next check retries them; items
-        # past MAX_POSTS_PER_CHECK are marked seen on purpose.
+        new = feed_reader.select_new(items, seen, len(items))
+        include = feed_reader.word_list(feed["include_words"])
+        exclude = feed_reader.word_list(feed["exclude_words"])
+        to_post = [i for i in new if feed_reader.wanted(i, include, exclude)]
+        posted = await self._post(channel, feed, title or feed["title"], to_post)
+        # Filtered-out items are marked seen (skipped for good). Wanted items
+        # that didn't make it to Discord stay unseen, so the next check retries.
+        unposted = {i.key for i in to_post} - posted
         await db.mark_feed_items_seen(feed["id"], [i.key for i in items if i.key not in unposted])
         await self._record_success(feed, result, title)
         if new:
-            logger.info("Feed #%s: posted %d new item(s)", feed["id"], len(new) - len(unposted))
+            logger.info("Feed #%s: %d new, %d filtered out, %d posted",
+                        feed["id"], len(new), len(new) - len(to_post), len(posted))
+
+    async def _post(self, channel, feed: dict, name: str, items: list) -> set[str]:
+        """Post items one by one, or as one summary when there are more than
+        the feed's summary_after. Archives what was posted and returns its keys."""
+        if not items:
+            return set()
+        role_id = feed["role_id"]
+        mentions = discord.AllowedMentions(everyone=False, users=False,
+                                           roles=[discord.Object(int(role_id))] if role_id else False)
+        posted, archive = set(), []
+        try:
+            if len(items) > feed["summary_after"]:
+                highlight = feed_reader.word_list(feed["highlight_words"])
+                for part in feed_reader.format_summary(name, items, highlight, role_id):
+                    message = await channel.send(part, allowed_mentions=mentions)
+                    if not posted:  # once the first part is out, don't repeat the summary on a retry
+                        posted = {i.key for i in items}
+                        archive = [(i, message.jump_url) for i in items]
+                    mentions = discord.AllowedMentions.none()  # ping once, not for every part
+            else:
+                for item in items:
+                    message = await channel.send(feed_reader.format_post(name, item, role_id),
+                                                 allowed_mentions=mentions)
+                    posted.add(item.key)
+                    archive.append((item, message.jump_url))
+        except discord.HTTPException as e:
+            logger.warning("Feed #%s: posting failed, retrying next check: %s", feed["id"], e)
+        if archive:
+            await db.archive_feed_posts([(feed["id"], name, i.title, feed_reader.clean_url(i.link), url)
+                                         for i, url in archive])
+        return posted
+
+    @staticmethod
+    def _describe(feed: dict) -> str:
+        none = "—"
+        role = f"<@&{feed['role_id']}>" if feed["role_id"] else none
+        return "\n".join([
+            f"**{discord.utils.escape_markdown(feed['title'] or feed['url'])}** <{feed['url']}>",
+            f"Channel: <#{feed['channel_id']}>",
+            f"Ping role: {role}",
+            f"Only titles with: {feed['include_words'] or 'anything'}",
+            f"Never titles with: {feed['exclude_words'] or none}",
+            f"Highlight in summaries: {feed['highlight_words'] or none}",
+            f"Summary when more than {feed['summary_after']} new posts at once",
+            f"Status: {'⚠️ failing: ' + feed['last_error'] if feed['failures'] else '✅ working'}",
+        ])
 
     async def _record_success(self, feed: dict, result=None, title: str | None = None):
         await db.record_feed_check(feed["id"], None, result and result.etag,

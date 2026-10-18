@@ -174,6 +174,8 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/feed add <url> [channel] [role]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role |
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
+| `/feed edit <feed> [...]` | RSS admins | Change a feed's channel, role, word filters or summary threshold; with just a feed, show its settings |
+| `/feed search <words>` | Anyone | Search everything the feeds have posted |
 | `/feed test <feed>` | RSS admins | Post a feed's newest item now, to check the format |
 
 > **Note:** Commands are guild-scoped (registered per-server) for instant availability.
@@ -195,8 +197,14 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   that answers "too many requests" (HTTP 429, or 503 with Retry-After) is
   left alone for as long as it asks, up to 6 hours.
 - Adding a feed skips everything already in it; only new items are posted,
-  oldest first, at most 5 per check. Nothing is posted twice, even across
-  restarts.
+  oldest first. Nothing is posted twice, even across restarts.
+- When more new items arrive at once than the feed's summary threshold
+  (default 5), they become one summary post instead of a flood, with nothing
+  dropped. Patch Tuesday in #cve is the typical case. Words set as
+  "highlight" (e.g. Remote Code Execution) are listed first, in bold.
+- Per-feed word filters (`/feed edit`): "exclude" words are never posted
+  (e.g. Chromium), and "include" words limit a feed to matching titles.
+- Everything posted is archived, and anyone can search it with `/feed search`.
 - Links are cleaned of tracking parameters, the same way chat links are.
 - A feed that fails for an hour is reported in the RSS audit channel
   (`FEED_ALERT_CHANNEL_ID`), and again when it recovers.
@@ -214,6 +222,7 @@ Located at `SKIPPY_DB_PATH` if set (on the server: `/var/lib/skippy/followup.db`
 - **audit_log** — timestamped log of every significant action
 - **feeds** — one row per feed: URL, optional ping role, caching headers, health
 - **feed_items** — which items of each feed were already posted
+- **feed_posts** — archive of everything posted (title, link, message), for `/feed search`
 
 ---
 
