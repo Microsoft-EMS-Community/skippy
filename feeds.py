@@ -160,13 +160,11 @@ class FeedCommands(commands.Cog):
     @app_commands.describe(url="The RSS or Atom feed URL",
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
                            role="Optional role to ping with every post",
-                           author="The member who writes it: credited and pinged on posts, and activity-tracked",
-                           post_latest="Post its newest item right away, without pings (off: skip what's there now)")
+                           author="The member who writes it: credited and pinged on posts, and activity-tracked")
     @app_commands.choices(channel=CHANNEL_CHOICES)
     @is_rss_admin()
     async def feed_add(self, interaction: discord.Interaction, url: str, channel: str | None = None,
-                       role: discord.Role | None = None, author: discord.Member | None = None,
-                       post_latest: bool = False):
+                       role: discord.Role | None = None, author: discord.Member | None = None):
         await interaction.response.defer(ephemeral=True)
         try:
             feed_id, title, items, target = await self._create_feed(
@@ -185,7 +183,7 @@ class FeedCommands(commands.Cog):
                          "so posts will show the role without pinging anyone.")
         if author:
             notes.append(f"\n👤 Posts credit {author.mention}, who's now on the RSS watchlist.")
-        newest = feed_reader.select_new(items, set(), 1) if post_latest else []
+        newest = feed_reader.select_new(items, set(), 1)
         if newest:
             # The newest item as a real post (archived, credited, threaded),
             # just without pings: a visible sign the feed is connected.
@@ -379,7 +377,7 @@ class FeedCommands(commands.Cog):
         suggestion = await db.get_suggestion(suggestion_id)
         author_id = suggestion["suggested_by"] if suggestion["own_blog"] else None
         try:
-            feed_id, title, _, channel = await self._create_feed(
+            feed_id, title, items, channel = await self._create_feed(
                 interaction.guild, suggestion["url"], DEFAULT_CHANNEL_ID, None, author_id, str(interaction.user.id))
         except (FeedError, sqlite3.IntegrityError) as e:
             await db.decide_suggestion(suggestion_id, "pending", None)  # back in the queue, buttons stay
@@ -388,6 +386,9 @@ class FeedCommands(commands.Cog):
                                             ephemeral=True)
             return
         credit = f", credited to <@{author_id}>" if author_id else ""
+        newest = feed_reader.select_new(items, set(), 1)
+        if newest:  # welcome the blog with its newest article, which also shows the feed works
+            await self._post(channel, await db.get_feed(feed_id, str(interaction.guild_id)), title, newest, ping=False)
         await self._close_card(interaction.message, discord.Color.green(),
                                f"✅ Approved by {interaction.user.mention}: feed #{feed_id} → {channel.mention}{credit}")
         await self._dm(suggestion["suggested_by"],

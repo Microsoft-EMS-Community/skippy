@@ -222,12 +222,12 @@ class CommunityTests(FeedTestCase):
         self.assertIn("e", await db.get_seen_feed_items(self.feed_id))  # ... and counted as posted
 
 
-    async def test_add_with_post_latest_posts_newest_without_pings(self):
+    async def test_add_posts_the_newest_item_without_pings(self):
         await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
         _, items = feed_reader.parse_feed(rss("new", "old").data)
         self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel))
         i = interaction()
-        await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed", post_latest=True)
+        await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(len(self.channel.sent), 1)
         content, mentions = self.channel.sent[0]
         self.assertTrue(content.startswith("<@&42> Blog - Post new · by <@77>\n"))  # looks like a normal post ...
@@ -235,11 +235,12 @@ class CommunityTests(FeedTestCase):
         self.assertEqual([r["title"] for r in await db.search_feed_posts(["new"])], ["Post new"])
         self.assertIn("Posted its newest item", i.followup.send.await_args.args[0])
 
-    async def test_add_without_post_latest_posts_nothing(self):
-        _, items = feed_reader.parse_feed(rss("new", "old").data)
-        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel))
-        await feeds.FeedCommands.feed_add.callback(self.cog, interaction(), "https://example.com/feed")
+    async def test_add_of_an_empty_feed_posts_nothing(self):
+        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", [], self.channel))
+        i = interaction()
+        await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(self.channel.sent, [])
+        self.assertIn("✅ Added", i.followup.send.await_args.args[0])
 
 def interaction(user_id="500", mod=True):
     i = mock.Mock()
@@ -262,8 +263,10 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         self.cog.bot = mock.Mock()
         self.cog._dm = mock.AsyncMock()
         self.sid = await db.add_suggestion("1", "https://blog.example/feed", "My Blog", "300", True, None)
-        self.channel = mock.Mock(mention="<#community>")
-        self.cog._create_feed = mock.AsyncMock(return_value=(7, "My Blog", 3, self.channel))
+        self.channel = FakeChannel()
+        self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://blog.example/feed", "My Blog", None, "500")
+        _, items = feed_reader.parse_feed(rss("latest", "older").data)
+        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "My Blog", items, self.channel))
 
     async def test_approve_adds_feed_credits_author_and_tells_everyone(self):
         i = interaction()
@@ -274,8 +277,10 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((suggestion["status"], suggestion["decided_by"]), ("approved", "500"))
         card = i.message.edit.await_args.kwargs
         self.assertIsNone(card["view"])  # buttons removed
-        self.assertIn("Approved by <@500>: feed #7", card["embed"].fields[-1].value)
+        self.assertIn(f"Approved by <@500>: feed #{self.feed_id}", card["embed"].fields[-1].value)
         self.assertIn("approved", self.cog._dm.await_args.args[1])
+        self.assertEqual(len(self.channel.sent), 1)  # the blog's newest article, as a welcome
+        self.assertTrue(self.channel.sent[0][0].startswith("My Blog - Post latest\n"))
 
     async def test_not_own_blog_gets_no_author(self):
         sid = await db.add_suggestion("1", "https://other.example/feed", "Other", "300", False, None)
@@ -296,6 +301,7 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await db.get_suggestion(self.sid))["status"], "pending")
         self.assertIn("HTTP 404", i.followup.send.await_args.args[0])
         i.message.edit.assert_not_awaited()  # card and buttons untouched
+        self.assertEqual(self.channel.sent, [])
 
     async def test_reject_with_reason(self):
         i = interaction()
