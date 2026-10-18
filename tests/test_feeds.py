@@ -4,6 +4,7 @@
 
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,7 @@ class FakeChannel:
         if any(f"/{k}\n" in content + "\n" for k in self.fail_on):
             raise discord.HTTPException(mock.Mock(status=503, reason="unavailable"), "down")
         self.sent.append((content, allowed_mentions))
+        return mock.Mock(jump_url=f"https://discord.com/channels/1/{CHANNEL_ID}/{len(self.sent)}")
 
 
 class FeedPollTests(unittest.IsolatedAsyncioTestCase):
@@ -78,12 +80,45 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])  # nothing posts twice
 
-    async def test_flood_is_capped_and_the_rest_skipped(self):
+    async def test_burst_becomes_one_summary_with_nothing_dropped(self):
         keys = [f"n{i}" for i in range(8, 0, -1)]  # n8 newest ... n1 oldest
         await self.check(rss(*keys))
-        self.assertEqual(self.posted(), ["n4", "n5", "n6", "n7", "n8"])
+        self.assertEqual(len(self.channel.sent), 1)
+        summary, mentions = self.channel.sent[0]
+        self.assertTrue(summary.startswith("<@&42> Blog - 8 new posts:"))
+        self.assertEqual([line.split("](<")[1][:-2] for line in summary.splitlines()[1:]],
+                         [f"https://example.com/n{i}" for i in range(1, 9)])  # oldest first, all 8
+        self.assertEqual([r.id for r in mentions.roles], [42])
         await self.check(rss(*keys))
-        self.assertEqual(len(self.channel.sent), 5)  # n1-n3 were skipped for good, not posted later
+        self.assertEqual(len(self.channel.sent), 1)  # not repeated
+
+    async def test_summary_threshold_is_per_feed(self):
+        await db.update_feed(self.feed_id, "1", summary_after=10)
+        await self.check(rss(*[f"n{i}" for i in range(8, 0, -1)]))
+        self.assertEqual(len(self.channel.sent), 8)  # under the threshold: posted one by one
+
+    async def test_filters_skip_for_good_and_highlight_orders_summary(self):
+        await db.update_feed(self.feed_id, "1", exclude_words="chromium", summary_after=1,
+                             highlight_words="remote code execution")
+        items = "".join(f"<item><title>{t}</title><link>https://e.com/{n}</link><guid>{n}</guid></item>"
+                        for n, t in (("3", "Chromium CVE-1: Use after free"), ("2", "CVE-2 Remote Code Execution"),
+                                     ("1", "CVE-3 Information Disclosure")))
+        result = FetchResult(f"<rss><channel><title>MSRC</title>{items}</channel></rss>".encode(), None, None)
+        await self.check(result)
+        lines = self.channel.sent[0][0].splitlines()
+        self.assertEqual(lines[0], "<@&42> MSRC - 2 new posts:")
+        self.assertIn("**CVE-2 Remote Code Execution**", lines[1])  # highlighted, first
+        self.assertIn("CVE-3 Information Disclosure", lines[2])
+        self.assertTrue(all("Chromium" not in line for line in lines))
+        self.assertEqual(await db.get_seen_feed_items(self.feed_id) >= {"1", "2", "3"}, True)
+
+    async def test_posts_are_archived_and_searchable(self):
+        await self.check(rss("c", "a", "b"))
+        found = await db.search_feed_posts(["post", "C"])
+        self.assertEqual([(r["title"], r["feed_title"], r["link"]) for r in found],
+                         [("Post c", "Blog", "https://example.com/c")])
+        self.assertTrue(found[0]["message_url"].startswith("https://discord.com/channels/"))
+        self.assertEqual(await db.search_feed_posts(["%"]), [])  # LIKE wildcards are literal
 
     async def test_failed_send_is_retried_next_check(self):
         self.channel.fail_on = {"d"}
@@ -141,6 +176,24 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
             await feeds.FeedCommands.poll.coro(self.cog)
         self.assertEqual(sorted(checked), list(range(12)))
         self.assertEqual(peak, feeds.CONCURRENT_CHECKS)
+
+
+class MigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_feeds_table_from_before_settings_is_upgraded(self):
+        path = os.environ["SKIPPY_DB_PATH"]
+        if os.path.exists(path):
+            os.remove(path)
+        with sqlite3.connect(path) as old:  # the feeds table as the first /feed release created it
+            old.execute("""CREATE TABLE feeds (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL, url TEXT NOT NULL, title TEXT, role_id TEXT, added_by TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, etag TEXT, last_modified TEXT,
+                last_checked TIMESTAMP, last_error TEXT, failures INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (url, channel_id))""")
+            old.execute("INSERT INTO feeds (guild_id, channel_id, url) VALUES ('1', '2', 'https://e.com/feed')")
+        await db.init_db()
+        await db.init_db()  # running it again is harmless
+        feed = (await db.get_feeds())[0]
+        self.assertEqual((feed["url"], feed["summary_after"], feed["exclude_words"]), ("https://e.com/feed", 5, None))
 
 
 if __name__ == "__main__":

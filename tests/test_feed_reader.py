@@ -112,6 +112,24 @@ class SelectAndFormatTests(unittest.TestCase):
         self.assertTrue(format_post("", item("t"), role_id="42").startswith("<@&42> t\n"))
         self.assertLessEqual(len(format_post("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))), 2000)
 
+    def test_word_filters(self):
+        self.assertEqual(feed_reader.word_list(" Chromium, ,Remote Code Execution "), ["chromium", "remote code execution"])
+        post = FeedItem("k", "CVE-1 Windows Remote Code Execution", "https://e.com", None)
+        self.assertTrue(feed_reader.wanted(post, [], []))
+        self.assertTrue(feed_reader.wanted(post, ["intune", "windows"], []))
+        self.assertFalse(feed_reader.wanted(post, ["intune"], []))
+        self.assertFalse(feed_reader.wanted(post, ["windows"], ["remote code"]))  # exclude wins
+
+    def test_summary_splits_and_counts_the_rest(self):
+        many = [FeedItem(str(i), f"[Item] {i}", f"https://e.com/{'x' * 80}/{i}", None) for i in range(200)]
+        parts = feed_reader.format_summary("F", many, [], max_messages=2)
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(len(p) <= 2000 for p in parts))
+        self.assertTrue(parts[0].startswith("F - 200 new posts:\n• [(Item) 0](<https://e.com/"))
+        self.assertFalse(parts[1].startswith("\n"))
+        listed = sum(p.count("\n• ") + p.startswith("• ") for p in parts)
+        self.assertTrue(parts[1].endswith(f"…and {200 - listed} more."))
+
 
 class FetchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

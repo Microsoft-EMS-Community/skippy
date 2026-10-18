@@ -173,6 +173,55 @@ def format_post(feed_title: str, item: FeedItem, role_id: str | None = None) -> 
     return text[:2000]
 
 
+def word_list(setting: str | None) -> list[str]:
+    """A feed's comma-separated word setting ("Chromium, Edge") as lowercase phrases."""
+    return [w.strip().lower() for w in (setting or "").split(",") if w.strip()]
+
+
+def mentions_any(item: FeedItem, words: list[str]) -> bool:
+    title = item.title.lower()
+    return any(word in title for word in words)
+
+
+def wanted(item: FeedItem, include: list[str], exclude: list[str]) -> bool:
+    """Exclude words always win; with include words, the title must mention one."""
+    if mentions_any(item, exclude):
+        return False
+    return not include or mentions_any(item, include)
+
+
+def format_summary(feed_title: str, items: list[FeedItem], highlight: list[str],
+                   role_id: str | None = None, max_messages: int = 3) -> list[str]:
+    """One summary instead of a burst of posts: a line per item, highlighted
+    ones first and bold, links shown without preview cards. Split over at
+    most `max_messages` messages; anything beyond that is counted."""
+    ordered = sorted(items, key=lambda i: not mentions_any(i, highlight))  # stable: keeps date order
+    name = discord.utils.escape_markdown(_one_line(feed_title)) if feed_title else "Feed"
+    header = f"{name} - {len(items)} new posts:"
+    if role_id:
+        header = f"<@&{role_id}> {header}"
+
+    messages, current = [], header
+    for index, item in enumerate(ordered):
+        # Square brackets would end the masked link early.
+        plain = _one_line(item.title)[:MAX_TITLE_CHARS].replace("[", "(").replace("]", ")")
+        title = discord.utils.escape_markdown(plain or "New post")
+        if mentions_any(item, highlight):
+            title = f"**{title}**"
+        # <url> inside a masked link stops Discord from adding a preview card per line.
+        line = f"• [{title}](<{clean_url(item.link)}>)"
+        if len(current) + len(line) + 1 > 1900:
+            messages.append(current)
+            if len(messages) == max_messages:
+                messages[-1] += f"\n…and {len(ordered) - index} more."
+                return messages
+            current = line
+        else:
+            current = f"{current}\n{line}"
+    messages.append(current)
+    return messages
+
+
 def _retry_after_seconds(value: str | None) -> int:
     """Retry-After as seconds (it's either a number or an HTTP date), kept
     between 1 minute and 6 hours. Missing or unreadable: 30 minutes."""
