@@ -97,7 +97,7 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(feeds.ALERT_AFTER_FAILURES + 2):
             await self.check(FeedError("HTTP 500"))
         self.assertEqual(len(self.alerts.sent), 1)
-        self.assertIn("failed 6 checks in a row: HTTP 500", self.alerts.sent[0][0])
+        self.assertIn(f"failed {feeds.ALERT_AFTER_FAILURES} checks in a row: HTTP 500", self.alerts.sent[0][0])
         await self.check(rss("a", "b"))
         self.assertEqual(len(self.alerts.sent), 2)
         self.assertIn("working again", self.alerts.sent[1][0])

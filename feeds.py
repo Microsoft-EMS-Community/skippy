@@ -21,7 +21,7 @@ from feed_reader import FeedError, RateLimited
 logger = logging.getLogger("followup-bot")
 
 MAX_POSTS_PER_CHECK = 5   # a feed that suddenly republishes everything can't flood a channel
-ALERT_AFTER_FAILURES = 6  # one hour of failed checks at the default 10-minute interval
+ALERT_AFTER_FAILURES = max(1, 60 // FEED_POLL_MINUTES)  # an hour of failed checks
 CONCURRENT_CHECKS = 5     # feeds checked at once, so slow or dead ones can't hold up the rest
 
 

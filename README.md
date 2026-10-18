@@ -190,7 +190,7 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
 
 - Posts read "Feed name - Post title" with the link below (Discord shows the
   preview card), the same plain format MEE6 used.
-- Feeds are checked every 10 minutes (`FEED_POLL_MINUTES`), five at a time,
+- Feeds are checked every 5 minutes (`FEED_POLL_MINUTES`), five at a time,
   using conditional requests so unchanged feeds cost almost nothing. A site
   that answers "too many requests" (HTTP 429, or 503 with Retry-After) is
   left alone for as long as it asks, up to 6 hours.

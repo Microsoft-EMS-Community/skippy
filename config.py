@@ -55,7 +55,7 @@ FEED_CHANNELS = {
     "ms-status": 1105424571798126652,
     "cve": 1312419690802450453,
 }
-FEED_POLL_MINUTES = 10                        # How often every feed is checked
+FEED_POLL_MINUTES = 5                         # How often every feed is checked
 FEED_ALERT_CHANNEL_ID = RSS_AUDIT_CHANNEL_ID  # Where failing feeds are reported
 
 # New Account heuristic tagging
