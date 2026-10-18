@@ -1,5 +1,7 @@
 # 🤖 Discord Follow-Up Bot
 
+[![tests](https://github.com/Microsoft-EMS-Community/skippy/actions/workflows/tests.yml/badge.svg)](https://github.com/Microsoft-EMS-Community/skippy/actions/workflows/tests.yml)
+
 A Discord bot that tracks members with open follow-ups, sends reminders, and gives helpers tools to manage and audit follow-up resolution.
 
 ---
