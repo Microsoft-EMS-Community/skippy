@@ -31,6 +31,14 @@ class FeedError(Exception):
     """A feed couldn't be fetched or read. The message is shown to admins."""
 
 
+class RateLimited(FeedError):
+    """The site asked us to slow down. Don't fetch it again for retry_after seconds."""
+
+    def __init__(self, status: int, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {status}, the site asked to wait {retry_after // 60} minutes")
+
+
 @dataclass
 class FeedItem:
     key: str                    # stable ID used to remember what was posted
@@ -83,6 +91,10 @@ async def fetch_feed(http: aiohttp.ClientSession, url: str,
                     continue
                 if resp.status == 304:
                     return FetchResult(None, etag, last_modified)
+                # 429 always means "slow down"; a 503 only when it says for how long.
+                retry_after = resp.headers.get("Retry-After")
+                if resp.status == 429 or (resp.status == 503 and retry_after):
+                    raise RateLimited(resp.status, _retry_after_seconds(retry_after))
                 if resp.status != 200:
                     raise FeedError(f"HTTP {resp.status}")
                 data = bytearray()
@@ -150,12 +162,29 @@ def select_new(items: list[FeedItem], seen: set[str], limit: int) -> list[FeedIt
 
 
 def format_post(feed_title: str, item: FeedItem, role_id: str | None = None) -> str:
+    """"Feed name - Post title" with the link below, which Discord turns into
+    a preview card. The same plain format MEE6 used, so the channel looks
+    unchanged after the switch."""
     title = discord.utils.escape_markdown(_one_line(item.title)[:MAX_TITLE_CHARS] or "New post")
-    head = f"**{discord.utils.escape_markdown(_one_line(feed_title))}**: {title}" if feed_title else f"**{title}**"
+    head = f"{discord.utils.escape_markdown(_one_line(feed_title))} - {title}" if feed_title else title
     text = f"{head}\n{clean_url(item.link)}"
     if role_id:
         text = f"<@&{role_id}> {text}"
     return text[:2000]
+
+
+def _retry_after_seconds(value: str | None) -> int:
+    """Retry-After as seconds (it's either a number or an HTTP date), kept
+    between 1 minute and 6 hours. Missing or unreadable: 30 minutes."""
+    seconds = 30 * 60
+    if value and value.strip().isdigit():
+        seconds = int(value)
+    elif value:
+        try:
+            seconds = int((email.utils.parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    return max(60, min(seconds, 6 * 3600))
 
 
 def _text(el) -> str:

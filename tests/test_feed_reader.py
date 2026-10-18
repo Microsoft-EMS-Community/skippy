@@ -1,9 +1,10 @@
 # Run from the repo root: venv/bin/python -m unittest discover -s tests -v
 # No test touches the internet: fetching runs against a local test server.
 
+import email.utils
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -107,8 +108,8 @@ class SelectAndFormatTests(unittest.TestCase):
 
     def test_format_post(self):
         post = format_post("My *Blog*", FeedItem("k", "  A\n  __title__ ", "https://x.com/p?utm_source=rss&id=1", None))
-        self.assertEqual(post, "**My \\*Blog\\***: A \\_\\_title\\_\\_\nhttps://x.com/p?id=1")
-        self.assertTrue(format_post("", item("t"), role_id="42").startswith("<@&42> **t**"))
+        self.assertEqual(post, "My \\*Blog\\* - A \\_\\_title\\_\\_\nhttps://x.com/p?id=1")
+        self.assertTrue(format_post("", item("t"), role_id="42").startswith("<@&42> t\n"))
         self.assertLessEqual(len(format_post("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))), 2000)
 
 
@@ -120,6 +121,11 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_get("/evil", lambda r: web.HTTPFound("http://blocked.test/"))
         app.router.add_get("/big", lambda r: web.Response(body=b"x" * (feed_reader.MAX_FEED_BYTES + 10)))
         app.router.add_get("/broken", lambda r: web.Response(status=500))
+        app.router.add_get("/slow-down", lambda r: web.Response(status=429, headers={"Retry-After": "120"}))
+        app.router.add_get("/slow-down-no-header", lambda r: web.Response(status=429))
+        app.router.add_get("/maintenance", lambda r: web.Response(
+            status=503, headers={"Retry-After": email.utils.format_datetime(datetime.now(timezone.utc) + timedelta(hours=2), usegmt=True)}))
+        app.router.add_get("/down", lambda r: web.Response(status=503))
         self.server = TestServer(app, host="127.0.0.1")
         await self.server.start_server()
         # The local server is (rightly) not a public address, so let it through.
@@ -160,6 +166,23 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
                 await feed_reader.fetch_feed(self.http, self.url(path))
         with self.assertRaisesRegex(FeedError, "http"):
             await feed_reader.fetch_feed(self.http, "file:///etc/passwd")
+
+    async def test_rate_limits_say_how_long_to_wait(self):
+        for path, wait in (("/slow-down", 120), ("/slow-down-no-header", 1800)):
+            with self.assertRaises(feed_reader.RateLimited) as ctx:
+                await feed_reader.fetch_feed(self.http, self.url(path))
+            self.assertEqual(ctx.exception.retry_after, wait, path)
+        with self.assertRaises(feed_reader.RateLimited) as ctx:
+            await feed_reader.fetch_feed(self.http, self.url("/maintenance"))  # Retry-After as a date
+        self.assertAlmostEqual(ctx.exception.retry_after, 7200, delta=60)
+        with self.assertRaises(FeedError) as ctx:  # a plain 503 is just an error, retried next check
+            await feed_reader.fetch_feed(self.http, self.url("/down"))
+        self.assertNotIsInstance(ctx.exception, feed_reader.RateLimited)
+
+    def test_retry_after_is_kept_between_a_minute_and_six_hours(self):
+        self.assertEqual(feed_reader._retry_after_seconds("5"), 60)
+        self.assertEqual(feed_reader._retry_after_seconds("999999"), 6 * 3600)
+        self.assertEqual(feed_reader._retry_after_seconds("not a date"), 1800)
 
 
 if __name__ == "__main__":

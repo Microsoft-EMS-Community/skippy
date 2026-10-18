@@ -3,8 +3,10 @@
 # Fetching and parsing live in feed_reader.py.
 # ============================================================
 
+import asyncio
 import logging
 import sqlite3
+import time
 
 import discord
 from discord import app_commands
@@ -14,12 +16,13 @@ import db
 import feed_reader
 from commands import is_rss_admin
 from config import FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_POLL_MINUTES
-from feed_reader import FeedError
+from feed_reader import FeedError, RateLimited
 
 logger = logging.getLogger("followup-bot")
 
 MAX_POSTS_PER_CHECK = 5   # a feed that suddenly republishes everything can't flood a channel
 ALERT_AFTER_FAILURES = 6  # one hour of failed checks at the default 10-minute interval
+CONCURRENT_CHECKS = 5     # feeds checked at once, so slow or dead ones can't hold up the rest
 
 
 class FeedCommands(commands.Cog):
@@ -29,6 +32,7 @@ class FeedCommands(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.skip_until: dict[int, float] = {}  # feed id -> monotonic time a site asked us to wait until
         self.poll.start()
 
     def cog_unload(self):
@@ -181,12 +185,17 @@ class FeedCommands(commands.Cog):
             feeds = await db.get_feeds()
             if not feeds:
                 return
-            async with feed_reader.session() as http:
-                for feed in feeds:
+            limit = asyncio.Semaphore(CONCURRENT_CHECKS)
+
+            async def check(http, feed):
+                async with limit:
                     try:
                         await self._check(http, feed)
                     except Exception:
                         logger.exception("Feed #%s: check failed", feed["id"])
+
+            async with feed_reader.session() as http:
+                await asyncio.gather(*(check(http, feed) for feed in feeds))
         except Exception:
             logger.exception("Feed poll failed")
 
@@ -195,6 +204,8 @@ class FeedCommands(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _check(self, http, feed: dict):
+        if time.monotonic() < self.skip_until.get(feed["id"], 0):
+            return  # the site asked us to wait (HTTP 429 / Retry-After)
         channel = self.bot.get_channel(int(feed["channel_id"]))
         try:
             if channel is None:
@@ -205,6 +216,8 @@ class FeedCommands(commands.Cog):
                 return
             title, items = feed_reader.parse_feed(result.data)
         except FeedError as e:
+            if isinstance(e, RateLimited):
+                self.skip_until[feed["id"]] = time.monotonic() + e.retry_after
             failures = await db.record_feed_check(feed["id"], str(e))
             if failures == ALERT_AFTER_FAILURES:
                 await self._alert(f"⚠️ Feed `#{feed['id']}` **{self._name(feed)}** has failed "

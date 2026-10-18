@@ -188,8 +188,12 @@ release notes, ...) in a fixed set of feed channels (`FEED_CHANNELS`:
 #community-feed by default, #ms-blogs, #ms-status and #cve); `/feed add` offers
 only those. Members with the RSS admin role manage feeds with `/feed`.
 
-- Feeds are checked every 10 minutes (`FEED_POLL_MINUTES`), using conditional
-  requests so unchanged feeds cost almost nothing.
+- Posts read "Feed name - Post title" with the link below (Discord shows the
+  preview card), the same plain format MEE6 used.
+- Feeds are checked every 10 minutes (`FEED_POLL_MINUTES`), five at a time,
+  using conditional requests so unchanged feeds cost almost nothing. A site
+  that answers "too many requests" (HTTP 429, or 503 with Retry-After) is
+  left alone for as long as it asks, up to 6 hours.
 - Adding a feed skips everything already in it; only new items are posted,
   oldest first, at most 5 per check. Nothing is posted twice, even across
   restarts.

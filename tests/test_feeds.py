@@ -2,6 +2,7 @@
 # Exercises the /feed polling logic against a throwaway database and a fake
 # Discord channel. No network: fetch_feed is replaced with canned feeds.
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -51,6 +52,7 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
         bot.get_channel = lambda cid: {CHANNEL_ID: self.channel, ALERT_CHANNEL_ID: self.alerts}.get(cid)
         self.cog = feeds.FeedCommands.__new__(feeds.FeedCommands)  # skip __init__: no poll loop
         self.cog.bot = bot
+        self.cog.skip_until = {}
         self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/feed", "Blog", "42", "9")
         await db.mark_feed_items_seen(self.feed_id, ["a", "b"])  # what /feed add does
 
@@ -59,6 +61,7 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
         fetch = mock.AsyncMock(side_effect=result) if isinstance(result, Exception) else mock.AsyncMock(return_value=result)
         with mock.patch.object(feed_reader, "fetch_feed", fetch):
             await self.cog._check(mock.Mock(), feed)
+        return fetch
 
     def posted(self):
         return [content.rsplit("/", 1)[1] for content, _ in self.channel.sent]
@@ -69,7 +72,7 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])
         content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("<@&42> **Blog**: Post c"))
+        self.assertTrue(content.startswith("<@&42> Blog - Post c\n"))
         self.assertEqual([r.id for r in mentions.roles], [42])
         self.assertFalse(mentions.everyone)
         await self.check(rss("d", "c", "a", "b"))
@@ -110,6 +113,34 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await db.remove_feed(self.feed_id, "1"))
         self.assertEqual(await db.get_seen_feed_items(self.feed_id), set())
         self.assertFalse(await db.remove_feed(self.feed_id, "1"))
+
+    async def test_rate_limited_feed_is_left_alone_until_the_wait_is_over(self):
+        await self.check(feed_reader.RateLimited(429, 600))
+        fetch = await self.check(rss("c", "a", "b"))
+        fetch.assert_not_awaited()
+        self.assertEqual(self.posted(), [])
+        self.cog.skip_until[self.feed_id] = 0  # wait over
+        fetch = await self.check(rss("c", "a", "b"))
+        fetch.assert_awaited_once()
+        self.assertEqual(self.posted(), ["c"])
+
+    async def test_poll_checks_every_feed_at_most_five_at_once(self):
+        running, peak, checked = 0, 0, []
+
+        async def slow_check(http, feed):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01)
+            checked.append(feed["id"])
+            running -= 1
+
+        many = [{"id": i} for i in range(12)]
+        with mock.patch.object(db, "get_feeds", mock.AsyncMock(return_value=many)), \
+             mock.patch.object(self.cog, "_check", slow_check):
+            await feeds.FeedCommands.poll.coro(self.cog)
+        self.assertEqual(sorted(checked), list(range(12)))
+        self.assertEqual(peak, feeds.CONCURRENT_CHECKS)
 
 
 if __name__ == "__main__":
