@@ -9,6 +9,7 @@ import socket
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, unquote_plus
 
 import aiohttp
+from aiohttp.abc import AbstractResolver
 
 URL_RE = re.compile(r"https?://\S+")
 
@@ -20,6 +21,9 @@ SHORTENER_DOMAINS = {
     "bit.ly", "tinyurl.com", "t.co", "lnkd.in", "goo.gl", "ow.ly", "buff.ly",
     "rebrand.ly", "is.gd", "shorturl.at", "cutt.ly", "rb.gy", "s.id", "tiny.cc",
     "amzn.to", "spoti.fi", "msems.community", "aka.ms",
+    # Mobile app share links
+    "share.google", "a.co", "vm.tiktok.com", "vt.tiktok.com", "pin.it",
+    "spotify.link", "fb.me",
 }
 SHORTENER_TIMEOUT = aiohttp.ClientTimeout(total=5)
 MAX_REDIRECT_HOPS = 5
@@ -33,28 +37,73 @@ class UnsafeRedirect(Exception):
         super().__init__(f"blocked redirect to internal host: {hop_url}")
 
 
-def _is_public_host(hostname: str) -> bool:
+# Azure's WireServer/host agent. It sits in public address space, so the
+# is_global check misses it, but it's only reachable from inside an Azure VM
+# (which this bot runs on), making it an SSRF target like the metadata IP.
+_BLOCKED_IPS = {ipaddress.ip_address("168.63.129.16")}
+
+
+def _is_public_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast and ip not in _BLOCKED_IPS
+
+
+async def _is_public_host(hostname: str) -> bool:
     """Resolve hostname and reject anything pointing at private/loopback/
     link-local/reserved space, so a malicious shortener can't redirect the
-    bot into an SSRF against internal infra (e.g. cloud metadata endpoints)."""
+    bot into an SSRF against internal infra (e.g. cloud metadata endpoints).
+    This is the up-front check that drives the user-facing warning, and the
+    only check for IP-literal URLs, which aiohttp connects to without a
+    resolver lookup. _PublicOnlyResolver enforces the same rule at connect
+    time for hostnames."""
     try:
-        infos = socket.getaddrinfo(hostname, None)
+        infos = await asyncio.get_running_loop().getaddrinfo(hostname, None)
     except socket.gaierror:
         return False
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return False
-    return True
+    return bool(infos) and all(_is_public_ip(info[4][0]) for info in infos)
 
+
+class _BlockedAddress(OSError):
+    """Raised by _PublicOnlyResolver when a host resolves to an internal address."""
+
+
+class _PublicOnlyResolver(AbstractResolver):
+    """DNS resolver that refuses any host with a non-public address.
+
+    Checking at connect time means the address that was vetted is the one
+    that gets connected to. _is_public_host alone does a separate lookup
+    before the request, which leaves a DNS-rebinding gap: a hostile domain
+    can answer with a public IP for the check and an internal one (e.g.
+    169.254.169.254) moments later for the real connection."""
+
+    def __init__(self):
+        self._inner = aiohttp.ThreadedResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        infos = await self._inner.resolve(host, port, family)
+        if not infos or not all(_is_public_ip(info["host"]) for info in infos):
+            raise _BlockedAddress(f"{host} resolves to a non-public address")
+        return infos
+
+    async def close(self):
+        await self._inner.close()
+
+# Any utm_* key is also stripped by prefix in _clean_query.
 TRACKING_PARAMS = {
-    # UTM
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "utm_id", "utm_reader", "utm_name", "utm_social", "utm_social-type",
     # Click IDs
     "fbclid", "gclid", "gclsrc", "dclid", "msclkid", "twclid", "ttclid",
-    "igshid", "gbraid", "wbraid", "yclid",
+    "igshid", "gbraid", "wbraid", "yclid", "rdt_cid",
+    # Google Shopping results / Google Ads / Analytics cross-domain linker
+    "srsltid", "gad_source", "gad_campaignid", "_gl",
+    # Marketo email links
+    "mkt_tok",
+    # Microsoft Learn / blogs / docs campaign id (usually written WT.mc_id)
+    "wt.mc_id",
     # Referral / affiliate
     "ref", "ref_src", "ref_url", "referrer", "spm", "affid",
     # Mailchimp / marketing platforms
@@ -63,11 +112,11 @@ TRACKING_PARAMS = {
     "_hsenc", "_hsmi", "hsCtaTracking", "vero_id", "vero_conv",
     "si", "s_kwcid", "ns_source", "ns_mchannel", "ns_campaign", "ns_linkname",
     # Instagram / Meta share tracking
-    "igsh", "igshid", "igsi",
+    "igsh", "igshid", "igsi", "mibextid",
     # TikTok
     "_r", "_t", "share_item_id",
     # LinkedIn
-    "trk", "trkinfo",
+    "trk", "trkinfo", "li_fat_id",
     # Pinterest
     "epik",
     # Snapchat
@@ -99,6 +148,7 @@ DOMAIN_TRACKING_PARAMS = {
     "booking.com": {"label", "aid"},
     "bing.com": {"form", "sk", "sp", "sc", "qs", "cvid", "pq"},
     "etsy.com": {"click_key", "click_sum"},
+    "msn.com": {"ocid"},
 }
 
 
@@ -116,8 +166,12 @@ def _clean_query(query: str, extra_params: set[str]) -> str:
     # the query, so kept params keep their exact original encoding. Re-encoding
     # rewrites characters like "," or ":" and made untouched URLs look cleaned.
     drop = {p.lower() for p in TRACKING_PARAMS | extra_params}
-    kept = [seg for seg in query.split("&")
-            if unquote_plus(seg.split("=", 1)[0]).lower() not in drop]
+    kept = []
+    for seg in query.split("&"):
+        key = unquote_plus(seg.split("=", 1)[0]).lower()
+        if key in drop or key.startswith("utm_"):
+            continue
+        kept.append(seg)
     return "&".join(kept)
 
 
@@ -187,7 +241,7 @@ async def _resolve_shortener(session: aiohttp.ClientSession, url: str) -> str | 
         parts = urlsplit(current)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             return None
-        if not _is_public_host(parts.hostname):
+        if not await _is_public_host(parts.hostname):
             raise UnsafeRedirect(current)
         for method in (session.head, session.get):
             try:
@@ -201,6 +255,12 @@ async def _resolve_shortener(session: aiohttp.ClientSession, url: str) -> str | 
                     if resp.status < 400:
                         return current
                     return None
+            except aiohttp.ClientConnectorDNSError as e:
+                # _PublicOnlyResolver refused the host at connect time (DNS
+                # rebinding); report it like the up-front check would.
+                if isinstance(e.os_error, _BlockedAddress):
+                    raise UnsafeRedirect(current) from e
+                continue
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 continue
         else:
@@ -223,7 +283,8 @@ async def clean_links_async(text: str) -> tuple[list[tuple[str, str]], list[str]
     if not shortener_urls:
         return changed, blocked
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver())
+    async with aiohttp.ClientSession(connector=connector) as session:
         resolved = await asyncio.gather(
             *(_resolve_shortener(session, u) for u in shortener_urls),
             return_exceptions=True,
