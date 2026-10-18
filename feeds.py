@@ -8,6 +8,8 @@ import logging
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from datetime import time as day_time
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -16,8 +18,9 @@ from discord.ext import commands, tasks
 import db
 import feed_reader
 from commands import is_rss_admin
-from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_POLL_MINUTES, FEED_SUGGESTIONS_CHANNEL_ID,
-                    FEED_THREAD_CHANNEL_IDS, RSS_ADMIN_ROLE_ID)
+from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_POLL_MINUTES, FEED_ROUNDUP_CHANNEL_ID,
+                    FEED_ROUNDUP_TIMEZONE, FEED_SUGGESTIONS_CHANNEL_ID, FEED_THREAD_CHANNEL_IDS,
+                    RSS_ADMIN_ROLE_ID)
 from feed_reader import FeedError, RateLimited
 
 logger = logging.getLogger("followup-bot")
@@ -37,6 +40,56 @@ ACTIVITY_MODES = [
     app_commands.Choice(name="enforce: pause inactive authors' posts", value="enforce"),
 ]
 ACTIVITY_BADGES = {"active": "🟢", "new": "🆕", "inactive": "🔴", "untracked": "⚪"}
+ROUNDUP_TZ = ZoneInfo(FEED_ROUNDUP_TIMEZONE)
+ROUNDUP_AT = day_time(9, 0)  # Mondays, local time in ROUNDUP_TZ
+ROUNDUP_ACTIONS = [
+    app_commands.Choice(name="preview (only you see it)", value="preview"),
+    app_commands.Choice(name="post it now", value="post"),
+    app_commands.Choice(name="weekly roundup on", value="on"),
+    app_commands.Choice(name="weekly roundup off", value="off"),
+]
+
+
+def build_roundup(posts: list[dict], now: datetime) -> discord.Embed | None:
+    """The weekly roundup: last week's posts grouped per blogger (most posts
+    first), plus a shout-out to the most active. None for a quiet week.
+    Mentions in embeds never ping, so crediting people here is silent."""
+    if not posts:
+        return None
+    groups: dict[str, dict] = {}
+    for p in posts:
+        key = p["author_id"] or f"feed-{p['feed_id']}"
+        group = groups.setdefault(key, {"author_id": p["author_id"], "feed_title": p["feed_title"] or "", "posts": []})
+        group["posts"].append(p)
+    ranked = sorted(groups.values(), key=lambda g: (-len(g["posts"]), g["feed_title"].lower()))
+
+    def who(group):
+        return f"<@{group['author_id']}>" if group["author_id"] else f"**{discord.utils.escape_markdown(group['feed_title'])}**"
+
+    header = (f"**{len(posts)} new post{'s' if len(posts) != 1 else ''} from {len(ranked)} "
+              f"blogger{'s' if len(ranked) != 1 else ''}** this week. Thanks for writing! 💙\n")
+    body, shown = "", 0
+    for group in ranked:
+        block = f"\n{who(group)}"
+        for p in group["posts"]:
+            title = discord.utils.escape_markdown(" ".join(p["title"].split())[:150]).replace("[", "(").replace("]", ")")
+            block += f"\n• [{title}](<{p['link']}>)"
+        if len(header) + len(body) + len(block) > 3900:  # embed descriptions stop at 4096
+            body += f"\n\n…and {len(posts) - shown} more posts."
+            break
+        body += block
+        shown += len(group["posts"])
+
+    week = (now - timedelta(days=1)).isocalendar().week  # the week that just ended
+    embed = discord.Embed(title=f"📰 Community roundup · week {week}", description=header + body,
+                          color=discord.Color.blurple())
+    if len(ranked) > 1:
+        podium = ["🥇", "🥈", "🥉"]
+        embed.add_field(name="🏆 Most active this week", value="\n".join(
+            f"{podium[n]} {who(g)} · {len(g['posts'])} post{'s' if len(g['posts']) != 1 else ''}"
+            for n, g in enumerate(ranked[:3])), inline=False)
+    embed.set_footer(text="Want your blog in here? Suggest it with /blog suggest")
+    return embed
 
 # A fixed list, not any channel: feeds only ever post where they're meant to.
 # Values are strings because channel IDs are too big for Discord's integers.
@@ -116,9 +169,11 @@ class FeedCommands(commands.Cog):
         self.bot = bot
         self.skip_until: dict[int, float] = {}  # feed id -> monotonic time a site asked us to wait until
         self.poll.start()
+        self.weekly_roundup.start()
 
     def cog_unload(self):
         self.poll.cancel()
+        self.weekly_roundup.cancel()
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CheckFailure):
@@ -552,6 +607,75 @@ class FeedCommands(commands.Cog):
         if new:
             logger.info("Feed #%s: %d new, %d filtered out, %d posted",
                         feed["id"], len(new), len(new) - len(to_post), len(posted))
+
+    # ──────────────────────────────────────────
+    # Weekly roundup: Mondays 09:00 in the roundup channel
+    # ──────────────────────────────────────────
+
+    # Checking every few minutes (rather than a fixed-time loop) keeps it at
+    # 09:00 local time across daylight saving changes, and catches up on its
+    # own if Skippy was restarting at 09:00.
+    @tasks.loop(minutes=FEED_POLL_MINUTES)
+    async def weekly_roundup(self):
+        try:
+            await self._maybe_post_roundup(datetime.now(ROUNDUP_TZ))
+        except Exception:
+            logger.exception("Weekly roundup failed")
+
+    @weekly_roundup.before_loop
+    async def before_weekly_roundup(self):
+        await self.bot.wait_until_ready()
+
+    async def _maybe_post_roundup(self, now: datetime) -> bool:
+        """Post this week's roundup if it's Monday from 09:00, it's switched
+        on and it hasn't gone out yet this week. Returns whether it posted."""
+        if now.weekday() != 0 or now.time() < ROUNDUP_AT:
+            return False
+        if await db.get_setting("feed_roundup", "on") != "on":
+            return False
+        week = "{0}-W{1}".format(*now.isocalendar()[:2])
+        if await db.get_setting("feed_roundup_last_week") == week:
+            return False
+        await db.set_setting("feed_roundup_last_week", week)  # first, so a crash can't post it twice
+        embed = build_roundup(await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID)), now)
+        channel = self.bot.get_channel(FEED_ROUNDUP_CHANNEL_ID)
+        if embed is None or channel is None:
+            logger.info("Weekly roundup: %s", "quiet week, nothing to post" if embed is None else "channel not found")
+            return False
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        logger.info("Weekly roundup posted for %s", week)
+        return True
+
+    @feed.command(name="roundup", description="The weekly community roundup: preview it, post it now, or switch it.")
+    @app_commands.describe(action="What to do (default: a preview only you see)")
+    @app_commands.choices(action=ROUNDUP_ACTIONS)
+    @is_rss_admin()
+    async def feed_roundup(self, interaction: discord.Interaction, action: str = "preview"):
+        when = f"Mondays 09:00 ({FEED_ROUNDUP_TIMEZONE}) in <#{FEED_ROUNDUP_CHANNEL_ID}>"
+        if action in ("on", "off"):
+            await db.set_setting("feed_roundup", action)
+            logger.info("Weekly roundup switched %s by %s", action, interaction.user)
+            await interaction.response.send_message(
+                f"Weekly roundup is now **{action}**" + (f": {when}." if action == "on" else "."), ephemeral=True)
+            return
+        now = datetime.now(ROUNDUP_TZ)
+        embed = build_roundup(await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID)), now)
+        if embed is None:
+            await interaction.response.send_message(
+                "No posts from the community feeds in the last 7 days, so there's nothing to round up.",
+                ephemeral=True)
+            return
+        if action == "preview":
+            status = "on" if await db.get_setting("feed_roundup", "on") == "on" else "off"
+            await interaction.response.send_message(
+                f"Preview (weekly roundup is **{status}**: {when}):", embed=embed, ephemeral=True)
+            return
+        channel = self.bot.get_channel(FEED_ROUNDUP_CHANNEL_ID)
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        # Counts as this week's roundup, so Monday's doesn't repeat it.
+        await db.set_setting("feed_roundup_last_week", "{0}-W{1}".format(*now.isocalendar()[:2]))
+        await interaction.response.send_message(f"Posted the roundup in {channel.mention}.", ephemeral=True)
+        logger.info("Roundup posted on demand by %s", interaction.user)
 
     # ──────────────────────────────────────────
     # Activity rule: authors' feeds post while they're active in the server

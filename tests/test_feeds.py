@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -38,9 +39,13 @@ class FakeChannel:
     def __init__(self, channel_id=CHANNEL_ID):
         self.id, self.sent, self.fail_on, self.threads = channel_id, [], set(), []
         self.mention = f"<#{channel_id}>"
+        self.embeds = []
         self.thread_error = None
 
-    async def send(self, content, allowed_mentions=None):
+    async def send(self, content=None, allowed_mentions=None, embed=None):
+        if embed is not None:
+            self.embeds.append(embed)
+            return mock.Mock()
         if any(f"/{k}\n" in content + "\n" for k in self.fail_on):
             raise discord.HTTPException(mock.Mock(status=503, reason="unavailable"), "down")
         self.sent.append((content, allowed_mentions))
@@ -339,6 +344,83 @@ class ActivityRuleTests(FeedTestCase):
         embed = i.response.send_message.await_args.kwargs["embed"]
         self.assertEqual(embed.title, "Activity rule: watch")
         self.assertIn("🔴 <@77> · 0 msg · Blog", embed.description)
+
+
+def post(title, author_id=None, feed_id=1, feed_title="Blog"):
+    return {"title": title, "link": f"https://e.com/{title.replace(' ', '-')}", "feed_title": feed_title,
+            "posted_at": "2026-10-15 10:00:00", "feed_id": feed_id, "author_id": author_id}
+
+
+MONDAY_9 = datetime(2026, 10, 19, 9, 0, tzinfo=feeds.ROUNDUP_TZ)
+
+
+class RoundupTests(FeedTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        patcher = mock.patch.object(feeds, "FEED_ROUNDUP_CHANNEL_ID", CHANNEL_ID)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_build_groups_per_blogger_with_a_podium(self):
+        embed = feeds.build_roundup([post("A1", "77"), post("B1", None, 2, "Some *Blog*"), post("A2", "77"),
+                                     post("C1", "99", 3)], MONDAY_9)
+        self.assertEqual(embed.title, "📰 Community roundup · week 42")
+        lines = embed.description.splitlines()
+        self.assertEqual(lines[0], "**4 new posts from 3 bloggers** this week. Thanks for writing! 💙")
+        self.assertEqual(lines[2:5], ["<@77>", "• [A1](<https://e.com/A1>)", "• [A2](<https://e.com/A2>)"])
+        self.assertIn("**Some \\*Blog\\***", embed.description)  # feeds without an author by name
+        self.assertTrue(embed.fields[0].value.startswith("🥇 <@77> · 2 posts\n🥈"))
+        self.assertIn("/blog suggest", embed.footer.text)
+
+    def test_build_quiet_week_and_single_blogger(self):
+        self.assertIsNone(feeds.build_roundup([], MONDAY_9))
+        embed = feeds.build_roundup([post("Only", "77")], MONDAY_9)
+        self.assertTrue(embed.description.startswith("**1 new post from 1 blogger**"))
+        self.assertEqual(embed.fields, [])  # no podium for one blogger
+
+    def test_build_stays_within_discord_limits(self):
+        many = [post(f"Post number {n} " + "x" * 100, str(1000 + n % 30), n) for n in range(200)]
+        embed = feeds.build_roundup(many, MONDAY_9)
+        self.assertLessEqual(len(embed.description), 4096)
+        self.assertRegex(embed.description, r"…and \d+ more posts\.$")
+
+    async def test_query_is_this_channels_feeds_last_seven_days(self):
+        other = await db.add_feed("1", "222", "https://other.example/feed", "Other", None, "9")
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None),
+                                     (self.feed_id, "Blog", "Stale", "https://e.com/s", None),
+                                     (other, "Other", "Elsewhere", "https://e.com/x", None)])
+        async with aiosqlite.connect(db.DB_PATH) as c:
+            await c.execute("UPDATE feed_posts SET posted_at = datetime('now', '-8 days') WHERE title = 'Stale'")
+            await c.commit()
+        self.assertEqual([p["title"] for p in await db.roundup_posts(str(CHANNEL_ID))], ["Fresh"])
+
+    async def test_posts_monday_from_nine_once_per_week(self):
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 - timedelta(minutes=1)))
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=1)))  # Tuesday
+        self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(minutes=3)))
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(hours=2)))  # already out
+        self.assertEqual(len(self.channel.embeds), 1)
+        self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))  # next week
+
+    async def test_switched_off_or_quiet_posts_nothing(self):
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9))  # quiet week
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
+        await db.set_setting("feed_roundup", "off")
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))
+        self.assertEqual(self.channel.embeds, [])
+
+    async def test_command_preview_post_and_switch(self):
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
+        i = interaction()
+        await feeds.FeedCommands.feed_roundup.callback(self.cog, i)  # default: preview
+        self.assertTrue(i.response.send_message.await_args.kwargs["ephemeral"])
+        self.assertEqual(self.channel.embeds, [])
+        await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="post")
+        self.assertEqual(len(self.channel.embeds), 1)
+        self.assertIsNotNone(await db.get_setting("feed_roundup_last_week"))  # Monday won't repeat it
+        await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="off")
+        self.assertEqual(await db.get_setting("feed_roundup"), "off")
 
 def interaction(user_id="500", mod=True):
     i = mock.Mock()

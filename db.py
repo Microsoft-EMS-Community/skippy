@@ -844,3 +844,19 @@ async def set_author_state(user_id: str, state: str):
             (user_id, state)
         )
         await db.commit()
+
+
+
+async def roundup_posts(channel_id: str, days: int = 7) -> list[dict]:
+    """What the feeds posting in channel_id posted in the last N days, oldest
+    first, with each feed's author."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT p.title, p.link, p.feed_title, p.posted_at, f.id AS feed_id, f.author_id
+               FROM feed_posts p JOIN feeds f ON f.id = p.feed_id
+               WHERE f.channel_id = ? AND p.posted_at >= datetime('now', ?)
+               ORDER BY p.posted_at, p.id""",
+            (channel_id, f"-{days} days")
+        )
+        return [dict(r) for r in await cursor.fetchall()]

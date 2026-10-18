@@ -175,6 +175,7 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
 | `/feed activity [mode] [min_messages]` | RSS admins | Show authors' activity, or switch the activity rule (off / watch / warn / enforce) |
+| `/feed roundup [action]` | RSS admins | Preview the weekly roundup (default), post it now, or switch it on/off |
 | `/feed edit <feed> [...]` | RSS admins | Change a feed's channel, role, word filters or summary threshold; with just a feed, show its settings |
 | `/blog search <words>` | Anyone | Search everything the feeds have posted |
 | `/blog suggest <url> [own_blog] [note]` | Anyone | Suggest a blog; mods approve or reject it with a button |
@@ -244,6 +245,11 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   days, counted by the RSS watchlist. Authors linked less than 30 days ago
   get a grace period. Feeds without an author, and ones exempted with
   `/feed edit activity_exempt:True`, are never affected.
+- **Weekly roundup:** Mondays 09:00 Danish time (`FEED_ROUNDUP_TIMEZONE`),
+  #community-feed (`FEED_ROUNDUP_CHANNEL_ID`) gets a recap of the week's
+  posts from its feeds, grouped per blogger, with a 🏆 top-3 shout-out.
+  Nobody is pinged. A week without posts gets no roundup. Mods preview it,
+  post it early or switch it off with `/feed roundup`.
 - `/feed` is only shown to members with Manage Roles (the Moderator role);
   everyone gets `/blog`. Server admins can change visibility under Server
   Settings → Integrations → Skippy.
