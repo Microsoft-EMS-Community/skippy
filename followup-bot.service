@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=bot
-WorkingDirectory=/opt/follow-up-bot
-EnvironmentFile=/opt/follow-up-bot/secrets.env
-ExecStart=/opt/follow-up-bot/venv/bin/python bot.py
+WorkingDirectory=/opt/skippy
+EnvironmentFile=/opt/skippy/secrets.env
+ExecStart=/opt/skippy/venv/bin/python bot.py
 Restart=always
 RestartSec=5
 

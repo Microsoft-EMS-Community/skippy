@@ -7,7 +7,7 @@ A Discord bot that tracks members with open follow-ups, sends reminders, and giv
 ## 🗂 File Structure
 
 ```
-follow-up-bot/
+skippy/
 ├── bot.py           # Main bot entry point (events, on_member_update, on_message)
 ├── db.py            # Async SQLite layer (aiosqlite)
 ├── config.py        # All configuration (tokens, IDs, DB path)
@@ -74,7 +74,7 @@ FOLLOWUP_CHANNEL_ID = 1234567890    # Channel for user pings
 HELPER_LOG_CHANNEL_ID = 1234567890  # Channel for helper logs
 HELPER_ROLE_ID = 1234567890         # Helper/mod role (can flag users)
 FLAG_EMOJI = "🔴"                   # Emoji helpers react with to flag
-DB_PATH = "/opt/follow-up-bot/followup.db"
+DB_PATH = ...                       # followup.db next to config.py (no edit needed)
 ```
 
 ---
@@ -82,7 +82,7 @@ DB_PATH = "/opt/follow-up-bot/followup.db"
 ## 📦 Install Dependencies
 
 ```bash
-cd follow-up-bot
+cd skippy
 
 # Create virtualenv
 python3 -m venv venv
@@ -96,7 +96,7 @@ venv/bin/pip install -r requirements.txt
 ## 🚀 Run Manually (for testing)
 
 ```bash
-cd follow-up-bot
+cd skippy
 venv/bin/python bot.py
 ```
 
