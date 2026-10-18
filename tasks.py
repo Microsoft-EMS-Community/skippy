@@ -9,7 +9,8 @@ from discord.ext import commands, tasks
 
 import datetime as dt
 import db
-from config import AWAITING_ROLE_ID, FOLLOWUP_CHANNEL_ID, HELPER_LOG_CHANNEL_ID, GUILD_ID, RSS_AUDIT_CHANNEL_ID
+import followup_notify
+from config import AWAITING_ROLE_ID, HELPER_LOG_CHANNEL_ID, GUILD_ID, RSS_AUDIT_CHANNEL_ID
 
 logger = logging.getLogger("followup-bot")
 
@@ -61,7 +62,7 @@ class FollowUpTasks(commands.Cog):
             # Try to log in the helper channel
             guild = self.bot.get_guild(int(fu["guild_id"]))
             if guild:
-                log_channel = guild.get_channel(FOLLOWUP_CHANNEL_ID)
+                log_channel = guild.get_channel(HELPER_LOG_CHANNEL_ID)
                 if log_channel:
                     await log_channel.send(
                         f"🚫 <@{fu['user_id']}> has had an open follow-up for **7+ days** "
@@ -85,15 +86,20 @@ class FollowUpTasks(commands.Cog):
             )
 
             guild = self.bot.get_guild(int(fu["guild_id"]))
-            if guild:
-                followup_channel = guild.get_channel(FOLLOWUP_CHANNEL_ID)
-                if followup_channel:
-                    await followup_channel.send(
-                        f"⏰ **Reminder** - <@{fu['user_id']}>, you have had an open "
-                        f"follow-up for **48+ hours**. Please respond or ask a helper "
-                        f"to close it out.\n"
-                        f"Original: {fu['message_link'] or 'N/A'}"
-                    )
+            member = guild and guild.get_member(int(fu["user_id"]))
+            if member:  # not if they've left the server
+                await followup_notify.notify_member(
+                    guild, member, fu["message_link"],
+                    reply_text=(
+                        f"⏰ **Reminder** - {member.mention}, this follow-up has been open for "
+                        f"**48+ hours**. Please reply here, or ask a helper to close it out."
+                    ),
+                    dm_text=(
+                        f"⏰ Reminder: you've had an open follow-up in {guild.name} for **48+ hours**."
+                        + (f"\n🔗 {fu['message_link']}" if fu["message_link"] else "")
+                        + "\nPlease respond to it, or ask a helper to close it out."
+                    ),
+                )
 
     @warning_check.before_loop
     async def before_warning_check(self):

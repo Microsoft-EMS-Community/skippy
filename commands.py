@@ -9,7 +9,8 @@ from discord.ext import commands
 
 import datetime
 import db
-from config import GUILD_ID, AWAITING_ROLE_ID, FOLLOWUP_CHANNEL_ID, HELPER_ROLE_IDS, RSS_ADMIN_ROLE_ID, RSS_AUDIT_CHANNEL_ID
+import followup_notify
+from config import GUILD_ID, AWAITING_ROLE_ID, HELPER_ROLE_IDS, RSS_ADMIN_ROLE_ID, RSS_AUDIT_CHANNEL_ID
 from config import FEED_ROUNDUP_CHANNEL_ID, FEED_VOTE_EMOJI
 
 
@@ -114,15 +115,25 @@ class FollowUpCommands(commands.Cog):
             f"🔴 {user.mention} has been flagged.", ephemeral=True
         )
 
-        # Ping user in follow-up channel
-        followup_channel = interaction.guild.get_channel(FOLLOWUP_CHANNEL_ID)
-        if followup_channel:
-            reason_text = f"\n> {reason}" if reason else ""
-            link_text = f"\n🔗 {clean_link}" if clean_link else ""
-            await followup_channel.send(
-                f"Hey {user.mention}, a helper has flagged you for a follow-up.{reason_text}{link_text}\n"
-                f"Please go back and address it. A helper will remove the flag once they see your response."
-            )
+        # Tell the user: on the linked message if there is one, otherwise by DM
+        reason_text = f"\n> {reason}" if reason else ""
+        reached = await followup_notify.notify_member(
+            interaction.guild, user, clean_link,
+            reply_text=(
+                f"Hey {user.mention}, a helper has flagged this message for follow-up.{reason_text}\n"
+                f"Please **reply to this message** to close it; a helper will remove the flag "
+                f"once they see your response."
+            ),
+            dm_text=(
+                f"Hey! A helper in {interaction.guild.name} has flagged you for a follow-up.{reason_text}"
+                + (f"\n🔗 {clean_link}" if clean_link else "")
+                + "\nPlease go back and address it; a helper will remove the flag once they see your response."
+            ),
+        )
+        if reached is None:
+            await interaction.followup.send(
+                f"⚠️ I couldn't reach {user.mention} (no message to reply to, and their DMs are closed). "
+                "You may want to ping them yourself.", ephemeral=True)
 
     # ──────────────────────────────────────────
     # /unmark @user
@@ -167,6 +178,7 @@ class FollowUpCommands(commands.Cog):
             return
 
         # Mark all open follow-ups as resolved in the DB
+        open_items = await db.get_open_follow_ups(str(user.id))
         await db.resolve_all_open_follow_ups(
             user_id=str(user.id),
             resolver_id=str(interaction.user.id)
@@ -186,12 +198,11 @@ class FollowUpCommands(commands.Cog):
             ephemeral=True
         )
 
-        # Post to follow-up channel as confirmation
-        followup_channel = interaction.guild.get_channel(FOLLOWUP_CHANNEL_ID)
-        if followup_channel:
-            await followup_channel.send(
-                f"✅ {user.mention}'s open follow-up(s) have been resolved by "
-                f"{interaction.user.mention}."
+        # Close the loop on each flagged message, so readers see it's resolved
+        for item in open_items[:3]:
+            await followup_notify.notify_member(
+                interaction.guild, user, item.get("message_link"),
+                reply_text=f"✅ {user.mention}, this follow-up was resolved by {interaction.user.mention}. Thanks!",
             )
 
     # ──────────────────────────────────────────
