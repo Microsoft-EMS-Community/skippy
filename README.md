@@ -169,7 +169,7 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/unmark @user` | Helpers only | Remove 🔴 role, resolve all open follow-ups, log action |
 | `/score @user` | Anyone | Show flag_count, resolved_count, open_count, avg resolution time |
 | `/audit` | Anyone | Show last 10 audit log entries |
-| `/feed add <url> [channel] [role] [author]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role; its newest item is posted right away (no pings) as a sign it's connected |
+| `/feed add <url> [channel] [role] [author] [name]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role; its newest item is posted right away (no pings) as a sign it's connected |
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
 | `/feed activity [mode] [min_messages]` | RSS admins | Show authors' activity, or switch the activity rule (off / watch / warn / enforce) |
@@ -207,6 +207,9 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   (e.g. Chromium), and "include" words limit a feed to matching titles.
 - Everything posted is archived, and anyone can search it with `/blog search`.
 - Links are cleaned of tracking parameters, the same way chat links are.
+- A feed can get a display `name` (`/feed add` or `/feed edit`) when its own
+  title is unhelpful, e.g. just "Blogs". Pasted URLs are forgiving: <...>
+  brackets, quotes, invisible characters and a missing https:// are fixed.
 - A feed that fails for an hour is reported in the RSS audit channel
   (`FEED_ALERT_CHANNEL_ID`), and again when it recovers.
 - Fetching follows the same rules as the link cleaner: public addresses only,

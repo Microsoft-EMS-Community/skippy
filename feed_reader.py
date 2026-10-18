@@ -115,6 +115,21 @@ async def fetch_feed(http: aiohttp.ClientSession, url: str,
     raise FeedError("too many redirects")
 
 
+# Zero-width and other invisible characters that ride along when links are
+# copied from web pages and documents.
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))
+
+
+def normalize_url(raw: str) -> str:
+    """A feed URL as people paste it: drop surrounding whitespace, invisible
+    characters, Discord's <...> preview-hiding brackets and quotes, and add
+    https:// when no scheme was given."""
+    url = raw.translate(_INVISIBLE).strip().strip("<>\"'`").strip()
+    if url and "://" not in url:
+        url = "https://" + url
+    return url
+
+
 def parse_feed(data: bytes) -> tuple[str, list[FeedItem]]:
     """Return (feed title, items in document order) for RSS 2.0, RSS 1.0 or Atom."""
     # Real feeds never declare entities; refusing them rules out entity

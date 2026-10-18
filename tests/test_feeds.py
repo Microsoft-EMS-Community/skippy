@@ -482,6 +482,32 @@ class RoundupTests(FeedTestCase):
         await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="off")
         self.assertEqual(await db.get_setting("feed_roundup"), "off")
 
+
+class FeedNameTests(FeedTestCase):
+    async def test_display_name_replaces_the_feeds_own_title(self):
+        await db.update_feed(self.feed_id, "1", display_name="CirriusTech")
+        await self.check(rss("c", "a", "b"))
+        self.assertTrue(self.channel.sent[0][0].startswith("<@&42> CirriusTech - Post c\n"))
+        self.assertEqual((await db.search_feed_posts(["post", "c"]))[0]["feed_title"], "CirriusTech")
+        feed = await db.get_feed(self.feed_id, "1")
+        self.assertEqual(feeds.feed_name(feed), "CirriusTech")
+        self.assertIn('calls itself "Blog"', feeds.FeedCommands._describe(feed))
+
+    async def test_add_takes_a_name_and_a_messy_url(self):
+        _, items = feed_reader.parse_feed(rss("new").data)
+        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blogs", items, self.channel))
+        await feeds.FeedCommands.feed_add.callback(self.cog, interaction(), "<\u200bcirriustech.co.uk/blog/index.xml>",
+                                                   name="CirriusTech")
+        self.assertEqual(self.cog._create_feed.await_args.args[1], "https://cirriustech.co.uk/blog/index.xml")
+        self.assertTrue(self.channel.sent[0][0].startswith("<@&42> CirriusTech - Post new\n"))
+
+    async def test_edit_sets_and_clears_the_name(self):
+        i = interaction()
+        await feeds.FeedCommands.feed_edit.callback(self.cog, i, self.feed_id, name="  CirriusTech ")
+        self.assertEqual((await db.get_feed(self.feed_id, "1"))["display_name"], "CirriusTech")
+        await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id, clear="display_name")
+        self.assertEqual(feeds.feed_name(await db.get_feed(self.feed_id, "1")), "Blog")
+
 def interaction(user_id="500", mod=True):
     i = mock.Mock()
     i.user = mock.Mock(id=int(user_id), mention=f"<@{user_id}>",
