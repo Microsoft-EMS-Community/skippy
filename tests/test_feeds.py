@@ -15,6 +15,7 @@ _tmp = tempfile.TemporaryDirectory()
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")  # config.py requires it
 os.environ["SKIPPY_DB_PATH"] = os.path.join(_tmp.name, "test.db")
 
+import aiosqlite  # noqa: E402
 import discord  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -241,6 +242,103 @@ class CommunityTests(FeedTestCase):
         await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(self.channel.sent, [])
         self.assertIn("✅ Added", i.followup.send.await_args.args[0])
+
+
+class ActivityRuleTests(FeedTestCase):
+    """Feed #1 is linked to author 77, who has been on the watchlist for 60 days."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.cog._dm = mock.AsyncMock()
+        self.cog.bot.get_guild = lambda gid: mock.Mock(name="guild")
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await self.age_watch("77", days=60)
+
+    @staticmethod
+    async def age_watch(user_id, days):
+        async with aiosqlite.connect(db.DB_PATH) as c:
+            await c.execute("UPDATE rss_watchlist SET added_at = datetime('now', ?) WHERE user_id = ?",
+                            (f"-{days} days", user_id))
+            await c.commit()
+
+    async def say_something(self, days_ago=0):
+        await db.log_rss_activity("77", "1", "5", "6", "https://discord.com/channels/1/5/6")
+        if days_ago:
+            async with aiosqlite.connect(db.DB_PATH) as c:
+                await c.execute("UPDATE rss_activity SET sent_at = datetime('now', ?)", (f"-{days_ago} days",))
+                await c.commit()
+
+    async def test_status_new_active_inactive_untracked(self):
+        status = feeds.FeedCommands._author_status
+        self.assertEqual(await status("77", 1), ("inactive", 0))
+        await self.say_something()
+        self.assertEqual(await status("77", 1), ("active", 1))
+        self.assertEqual(await status("77", 5), ("inactive", 1))  # bar raised to 5
+        await db.add_to_watchlist("88", "1", "9")  # just linked: grace period
+        self.assertEqual(await status("88", 1), ("new", 0))
+        self.assertEqual(await status("99", 1), ("untracked", 0))
+
+    async def test_boundary_day_messages_count(self):
+        # Stored as "YYYY-MM-DD HH:MM:SS"; the cutoff used to be compared in
+        # ISO "T" format, which dropped the oldest day of the window.
+        await self.say_something(days_ago=29.9)
+        self.assertEqual(await db.get_rss_activity_count("77", days=30), 1)
+
+    async def test_off_and_watch_never_hold_or_notify(self):
+        for mode in ("off", "watch"):
+            await db.set_setting("feed_activity_mode", mode)
+            await self.check(rss("c", "a", "b") if mode == "off" else rss("d", "c", "a", "b"))
+        self.assertEqual(self.posted(), ["c", "d"])
+        self.assertEqual((self.alerts.sent, self.cog._dm.await_count), ([], 0))
+
+    async def test_warn_reminds_once_and_keeps_posting(self):
+        await db.set_setting("feed_activity_mode", "warn")
+        await self.check(rss("c", "a", "b"))
+        await self.check(rss("d", "c", "a", "b"))
+        self.assertEqual(self.posted(), ["c", "d"])
+        self.assertEqual(len(self.alerts.sent), 1)
+        self.assertIn("friendly reminder", self.alerts.sent[0][0])
+        self.assertEqual(self.cog._dm.await_count, 1)
+
+    async def test_enforce_pauses_skips_and_resumes(self):
+        await db.set_setting("feed_activity_mode", "enforce")
+        await self.check(rss("c", "a", "b"))
+        self.assertEqual(self.posted(), [])
+        self.assertIn("c", await db.get_seen_feed_items(self.feed_id))  # skipped, not saved up
+        self.assertIn("paused", self.alerts.sent[-1][0])
+        await self.say_something()
+        await self.check(rss("d", "c", "a", "b"))
+        self.assertEqual(self.posted(), ["d"])
+        self.assertIn("active again", self.alerts.sent[-1][0])
+        self.assertIn("Welcome back", self.cog._dm.await_args.args[1])
+        self.assertEqual(len(self.alerts.sent), 2)
+
+    async def test_warned_then_enforced_gets_the_pause_message(self):
+        await db.set_setting("feed_activity_mode", "warn")
+        await self.check(rss("a", "b"))
+        await db.set_setting("feed_activity_mode", "enforce")
+        await self.check(rss("c", "a", "b"))
+        self.assertEqual(self.posted(), [])
+        self.assertEqual(self.cog._dm.await_count, 2)
+        self.assertIn("paused", self.cog._dm.await_args.args[1])
+
+    async def test_exempt_and_new_authors_are_left_alone(self):
+        await db.set_setting("feed_activity_mode", "enforce")
+        await db.update_feed(self.feed_id, "1", activity_exempt=1)
+        await self.check(rss("c", "a", "b"))
+        await db.update_feed(self.feed_id, "1", activity_exempt=0)
+        await self.age_watch("77", days=3)  # pretend just linked
+        await self.check(rss("d", "c", "a", "b"))
+        self.assertEqual(self.posted(), ["c", "d"])
+        self.assertEqual(self.alerts.sent, [])
+
+    async def test_activity_command_sets_mode_and_lists_authors(self):
+        i = interaction()
+        await feeds.FeedCommands.feed_activity.callback(self.cog, i, mode="watch", min_messages=3)
+        self.assertEqual(await self.cog._activity_rule(), ("watch", 3))
+        embed = i.response.send_message.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "Activity rule: watch")
+        self.assertIn("🔴 <@77> · 0 msg · Blog", embed.description)
 
 def interaction(user_id="500", mod=True):
     i = mock.Mock()

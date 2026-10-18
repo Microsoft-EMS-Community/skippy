@@ -7,7 +7,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -26,6 +26,17 @@ ALERT_AFTER_FAILURES = max(1, 60 // FEED_POLL_MINUTES)  # an hour of failed chec
 CONCURRENT_CHECKS = 5     # feeds checked at once, so slow or dead ones can't hold up the rest
 MAX_PENDING_SUGGESTIONS = 3  # per member, so nobody can flood the mods' queue
 THREAD_ARCHIVE_MINUTES = 4320  # discussion threads on posts go quiet after 3 days
+ACTIVITY_DAYS = 30        # activity window, and the grace period for newly linked authors
+
+# The activity rule for feeds linked to an author, switched by mods with
+# /feed activity: phase it in by watching first, then reminding, then pausing.
+ACTIVITY_MODES = [
+    app_commands.Choice(name="off", value="off"),
+    app_commands.Choice(name="watch: only show authors' activity", value="watch"),
+    app_commands.Choice(name="warn: remind inactive authors, keep posting", value="warn"),
+    app_commands.Choice(name="enforce: pause inactive authors' posts", value="enforce"),
+]
+ACTIVITY_BADGES = {"active": "🟢", "new": "🆕", "inactive": "🔴", "untracked": "⚪"}
 
 # A fixed list, not any channel: feeds only ever post where they're meant to.
 # Values are strings because channel IDs are too big for Discord's integers.
@@ -220,11 +231,14 @@ class FeedCommands(commands.Cog):
         if not feeds:
             await interaction.response.send_message("No feeds yet. Add one with `/feed add`.", ephemeral=True)
             return
+        mode, min_messages = await self._activity_rule()
         lines = []
         for f in feeds:
             status = f"⚠️ failing: {f['last_error']}" if f["failures"] else "✅"
             role = f" · pings <@&{f['role_id']}>" if f["role_id"] else ""
             author = f" · by <@{f['author_id']}>" if f["author_id"] else ""
+            if f["author_id"] and mode != "off" and not f["activity_exempt"]:
+                author += " " + ACTIVITY_BADGES[(await self._author_status(f["author_id"], min_messages))[0]]
             filters = " · 🔎 filtered" if f["include_words"] or f["exclude_words"] else ""
             name = discord.utils.escape_markdown(f["title"] or f["url"])
             lines.append(f"`#{f['id']}` **{name}** → <#{f['channel_id']}>{author}{role}{filters} · {status}")
@@ -243,6 +257,7 @@ class FeedCommands(commands.Cog):
         exclude="Never post titles mentioning any of these words (comma-separated)",
         highlight="In summaries, list titles mentioning these first, in bold (comma-separated)",
         summary_after="More new posts than this at once become one summary post (default 5)",
+        activity_exempt="Exempt this feed from the activity rule (see /feed activity)",
         clear="Remove one setting")
     @app_commands.choices(channel=CHANNEL_CHOICES, clear=CLEARABLE_SETTINGS)
     @is_rss_admin()
@@ -251,7 +266,7 @@ class FeedCommands(commands.Cog):
                         include: str | None = None, exclude: str | None = None,
                         highlight: str | None = None,
                         summary_after: app_commands.Range[int, 1, 25] | None = None,
-                        clear: str | None = None):
+                        activity_exempt: bool | None = None, clear: str | None = None):
         guild_id = str(interaction.guild_id)
         if not await db.get_feed(feed, guild_id):
             await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
@@ -270,6 +285,8 @@ class FeedCommands(commands.Cog):
                 changes[name] = ", ".join(feed_reader.word_list(value)) or None
         if summary_after:
             changes["summary_after"] = summary_after
+        if activity_exempt is not None:
+            changes["activity_exempt"] = int(activity_exempt)
         if clear:
             changes[clear] = None
         try:
@@ -500,6 +517,7 @@ class FeedCommands(commands.Cog):
     async def _check(self, http, feed: dict):
         if time.monotonic() < self.skip_until.get(feed["id"], 0):
             return  # the site asked us to wait (HTTP 429 / Retry-After)
+        held = await self._activity_gate(feed)
         channel = self.bot.get_channel(int(feed["channel_id"]))
         try:
             if channel is None:
@@ -522,7 +540,9 @@ class FeedCommands(commands.Cog):
         new = feed_reader.select_new(items, seen, len(items))
         include = feed_reader.word_list(feed["include_words"])
         exclude = feed_reader.word_list(feed["exclude_words"])
-        to_post = [i for i in new if feed_reader.wanted(i, include, exclude)]
+        # While the author's posts are paused, new items are skipped, not
+        # saved up: coming back doesn't flood the channel with old posts.
+        to_post = [] if held else [i for i in new if feed_reader.wanted(i, include, exclude)]
         posted = await self._post(channel, feed, title or feed["title"], to_post)
         # Filtered-out items are marked seen (skipped for good). Wanted items
         # that didn't make it to Discord stay unseen, so the next check retries.
@@ -532,6 +552,122 @@ class FeedCommands(commands.Cog):
         if new:
             logger.info("Feed #%s: %d new, %d filtered out, %d posted",
                         feed["id"], len(new), len(new) - len(to_post), len(posted))
+
+    # ──────────────────────────────────────────
+    # Activity rule: authors' feeds post while they're active in the server
+    # ──────────────────────────────────────────
+
+    @staticmethod
+    async def _author_status(author_id: str, min_messages: int) -> tuple[str, int]:
+        """("active" | "new" | "inactive" | "untracked", messages in the window).
+        Activity comes from the RSS watchlist, which only counts messages since
+        the member was added, so newly added authors get a grace period."""
+        entry = await db.get_watch_entry(author_id)
+        if entry is None:
+            return "untracked", 0  # a mod took them off the watchlist; nothing to judge by
+        count = await db.get_rss_activity_count(author_id, days=ACTIVITY_DAYS)
+        if count >= min_messages:
+            return "active", count
+        added = datetime.fromisoformat(entry["added_at"]).replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - added < timedelta(days=ACTIVITY_DAYS):
+            return "new", count
+        return "inactive", count
+
+    @staticmethod
+    async def _activity_rule() -> tuple[str, int]:
+        return (await db.get_setting("feed_activity_mode", "off"),
+                int(await db.get_setting("feed_activity_min_messages", "1")))
+
+    async def _activity_gate(self, feed: dict) -> bool:
+        """Apply the activity rule to a feed's author, announcing any change
+        once. Returns True when the author's new posts should be held back."""
+        if not feed["author_id"] or feed["activity_exempt"]:
+            return False
+        mode, min_messages = await self._activity_rule()
+        if mode not in ("warn", "enforce"):
+            return False
+        status, count = await self._author_status(feed["author_id"], min_messages)
+        if status == "inactive":
+            state = "paused" if mode == "enforce" else "warned"
+        else:
+            state = "active"
+        previous = await db.get_author_state(feed["author_id"]) or "active"
+        if state != previous:
+            await db.set_author_state(feed["author_id"], state)
+            await self._announce_activity_change(feed, previous, state, count, min_messages)
+        return state == "paused"
+
+    async def _announce_activity_change(self, feed: dict, previous: str, state: str,
+                                        count: int, min_messages: int):
+        author, name = f"<@{feed['author_id']}>", self._name(feed)
+        guild = self.bot.get_guild(int(feed["guild_id"]))
+        server = guild.name if guild else "the server"
+        bar = f"{count} message(s) in {ACTIVITY_DAYS} days; active means {min_messages}+"
+        if state == "paused":
+            await self._alert(f"⏸️ {author} is inactive ({bar}), so new posts from **{name}** are paused "
+                              "until they're active again.")
+            await self._dm(feed["author_id"],
+                           f"⏸️ Hi! New posts from your blog **{name}** are paused in the {server} content tracker, "
+                           f"because you haven't been active in the server lately. As soon as you're back in the "
+                           f"conversation ({min_messages}+ message(s) in {ACTIVITY_DAYS} days), your posts are "
+                           "shared again automatically.")
+        elif state == "warned" and previous == "active":
+            await self._alert(f"📉 {author} is inactive ({bar}). **{name}** still posts; they got a friendly reminder.")
+            await self._dm(feed["author_id"],
+                           f"👋 Hi! Your blog **{name}** is part of the {server} content tracker, and we'd love to "
+                           "see you around the server too. Blogs in the tracker are for active members, so if you "
+                           "stay quiet, new posts may get paused. Joining a conversation now and then is all it takes.")
+        elif state == "warned":  # paused -> warned: mods switched enforce off
+            await self._alert(f"▶️ **{name}** by {author} posts again: the activity rule is back to reminders only.")
+        elif previous == "paused":
+            await self._alert(f"▶️ {author} is active again, so **{name}** posts again.")
+            await self._dm(feed["author_id"],
+                           f"▶️ Welcome back! Posts from your blog **{name}** are being shared in {server} again.")
+        else:
+            await self._alert(f"📈 {author} is active again.")
+
+    @feed.command(name="activity", description="The activity rule for authors' feeds: see who it affects, or change it.")
+    @app_commands.describe(mode="Phase it in: watch first, then warn, then enforce",
+                           min_messages=f"Messages in the last {ACTIVITY_DAYS} days that count as active (default 1)")
+    @app_commands.choices(mode=ACTIVITY_MODES)
+    @is_rss_admin()
+    async def feed_activity(self, interaction: discord.Interaction, mode: str | None = None,
+                            min_messages: app_commands.Range[int, 1, 50] | None = None):
+        if mode:
+            await db.set_setting("feed_activity_mode", mode)
+        if min_messages:
+            await db.set_setting("feed_activity_min_messages", str(min_messages))
+        if mode or min_messages:
+            logger.info("Feed activity rule set by %s: mode=%s min_messages=%s", interaction.user, mode, min_messages)
+        mode, min_messages = await self._activity_rule()
+
+        by_author: dict[str, list[dict]] = {}
+        for f in await db.get_feeds(str(interaction.guild_id)):
+            if f["author_id"]:
+                by_author.setdefault(f["author_id"], []).append(f)
+        lines = []
+        for author_id, author_feeds in by_author.items():
+            status, count = await self._author_status(author_id, min_messages)
+            paused = await db.get_author_state(author_id) == "paused"
+            names = ", ".join(self._name(f) + (" (exempt)" if f["activity_exempt"] else "") for f in author_feeds)
+            lines.append(f"{ACTIVITY_BADGES[status]} <@{author_id}> · {count} msg · {names}"
+                         + (" · ⏸️ paused" if paused else ""))
+        effect = {
+            "off": "Nothing happens; authors' activity isn't checked.",
+            "watch": "Activity is shown here and nothing else happens: a good first phase to see who'd be affected.",
+            "warn": "Authors who go 🔴 get one friendly DM and mods get a notice. Their posts keep going.",
+            "enforce": "🔴 authors' new posts are skipped until they're active again; they and the mods are told both ways.",
+        }[mode]
+        embed = discord.Embed(
+            title=f"Activity rule: {mode}",
+            description=(f"{effect}\nActive means {min_messages}+ message(s) in the last {ACTIVITY_DAYS} days. "
+                         f"🆕 = linked less than {ACTIVITY_DAYS} days ago (grace period). Feeds without an author, "
+                         "and exempt ones, are never affected.\n\n"
+                         + ("\n".join(lines) or "No feeds are linked to an author yet."))[:4000],
+            color=discord.Color.blurple())
+        embed.set_footer(text="Exempt a feed with /feed edit feed:<feed> activity_exempt:True")
+        await interaction.response.send_message(embed=embed, ephemeral=True,
+                                                allowed_mentions=discord.AllowedMentions.none())
 
     async def _post(self, channel, feed: dict, name: str, items: list, ping: bool = True) -> set[str]:
         """Post items one by one, or as one summary when there are more than
@@ -592,6 +728,7 @@ class FeedCommands(commands.Cog):
             f"Never titles with: {feed['exclude_words'] or none}",
             f"Highlight in summaries: {feed['highlight_words'] or none}",
             f"Summary when more than {feed['summary_after']} new posts at once",
+            f"Activity rule: {'exempt' if feed['activity_exempt'] else 'applies' if feed['author_id'] else 'n/a (no author)'}",
             f"Status: {'⚠️ failing: ' + feed['last_error'] if feed['failures'] else '✅ working'}",
         ])
 

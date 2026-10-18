@@ -174,6 +174,7 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/feed add <url> [channel] [role] [author]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role; its newest item is posted right away (no pings) as a sign it's connected |
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
+| `/feed activity [mode] [min_messages]` | RSS admins | Show authors' activity, or switch the activity rule (off / watch / warn / enforce) |
 | `/feed edit <feed> [...]` | RSS admins | Change a feed's channel, role, word filters or summary threshold; with just a feed, show its settings |
 | `/blog search <words>` | Anyone | Search everything the feeds have posted |
 | `/blog suggest <url> [own_blog] [note]` | Anyone | Suggest a blog; mods approve or reject it with a button |
@@ -228,6 +229,21 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   them on the RSS watchlist so their server activity is tracked.
 - **Discussion threads:** posts in #community-feed (`FEED_THREAD_CHANNEL_IDS`)
   get a thread on the post itself, named after the article.
+- **Activity rule:** the content tracker is for active members. A feed
+  linked to an author follows the rule mods set with `/feed activity`,
+  phased in step by step:
+  - `off`: nothing is checked (the default).
+  - `watch`: `/feed activity` and `/feed list` show each author's activity
+    (🟢 active, 🆕 grace period, 🔴 inactive). Nothing else happens.
+  - `warn`: an author who goes 🔴 gets one friendly DM and mods get a notice
+    in the RSS audit channel; their posts keep going.
+  - `enforce`: a 🔴 author's new posts are skipped (not saved up) until
+    they're active again. They and the mods are told both ways.
+
+  Active means at least `min_messages` (default 1) messages in the last 30
+  days, counted by the RSS watchlist. Authors linked less than 30 days ago
+  get a grace period. Feeds without an author, and ones exempted with
+  `/feed edit activity_exempt:True`, are never affected.
 - `/feed` is only shown to members with Manage Roles (the Moderator role);
   everyone gets `/blog`. Server admins can change visibility under Server
   Settings → Integrations → Skippy.

@@ -112,6 +112,20 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 decided_at TIMESTAMP
             );
+
+            -- Settings mods change from Discord (e.g. the feed activity rule).
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- Last activity-rule state per feed author ('active', 'warned',
+            -- 'paused'), so each change is announced once.
+            CREATE TABLE IF NOT EXISTS feed_author_state (
+                user_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         # Columns added after the feeds table first shipped; add them to
         # databases created before that.
@@ -121,6 +135,7 @@ async def init_db():
             "highlight_words": "TEXT",
             "summary_after": "INTEGER NOT NULL DEFAULT 5",
             "author_id": "TEXT",
+            "activity_exempt": "INTEGER NOT NULL DEFAULT 0",
         })
         await db.commit()
 
@@ -511,7 +526,7 @@ async def log_rss_activity(user_id: str, guild_id: str, channel_id: str,
 
 async def get_rss_activity(user_id: str, days: int = 30) -> list[dict]:
     """Return all activity rows for a user within the last N days."""
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat(" ")  # same format as CURRENT_TIMESTAMP rows
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -526,7 +541,7 @@ async def get_rss_activity(user_id: str, days: int = 30) -> list[dict]:
 
 async def get_rss_activity_count(user_id: str, days: int = 30) -> int:
     """Return message count for a user in the last N days."""
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat(" ")  # same format as CURRENT_TIMESTAMP rows
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT COUNT(*) FROM rss_activity WHERE user_id = ? AND sent_at >= ?",
@@ -551,7 +566,7 @@ async def get_latest_rss_message(user_id: str) -> dict | None:
 
 async def cleanup_rss_activity(days: int = 30) -> int:
     """Delete rss_activity rows older than N days. Returns count deleted."""
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat()
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).isoformat(" ")  # same format as CURRENT_TIMESTAMP rows
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "DELETE FROM rss_activity WHERE sent_at < ?", (cutoff,)
@@ -660,7 +675,7 @@ async def record_feed_check(feed_id: int, error: str | None, etag: str | None = 
 
 
 FEED_SETTINGS = ("channel_id", "role_id", "include_words", "exclude_words",
-                 "highlight_words", "summary_after", "author_id")
+                 "highlight_words", "summary_after", "author_id", "activity_exempt")
 
 
 async def update_feed(feed_id: int, guild_id: str, **settings) -> bool:
@@ -783,3 +798,49 @@ async def decide_suggestion(suggestion_id: int, status: str, decided_by: str | N
                 (status, decided_by, reason, suggestion_id))
         await db.commit()
         return cursor.rowcount > 0
+
+
+
+# ──────────────────────────────────────────────
+# Settings and the feed activity rule
+# ──────────────────────────────────────────────
+
+async def get_setting(key: str, default: str | None = None) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value)
+        )
+        await db.commit()
+
+
+async def get_watch_entry(user_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM rss_watchlist WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_author_state(user_id: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT state FROM feed_author_state WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_author_state(user_id: str, state: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO feed_author_state (user_id, state) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, changed_at = CURRENT_TIMESTAMP""",
+            (user_id, state)
+        )
+        await db.commit()
