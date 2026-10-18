@@ -15,6 +15,8 @@ skippy/
 ├── config.py        # All configuration (tokens, IDs, DB path)
 ├── commands.py      # Slash commands (/unmark /score /audit)
 ├── tasks.py         # Background 24h loop (48h warning, 7d ignored)
+├── feeds.py         # /feed commands + loop posting new RSS/Atom items
+├── feed_reader.py   # Fetching and parsing RSS/Atom feeds
 ├── requirements.txt # Python dependencies (pinned)
 ├── tests/           # Unit tests (no network or Discord needed)
 ├── deploy/          # Reference copies of the server's service, sandbox and auto-deploy setup
@@ -169,9 +171,33 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/unmark @user` | Helpers only | Remove 🔴 role, resolve all open follow-ups, log action |
 | `/score @user` | Anyone | Show flag_count, resolved_count, open_count, avg resolution time |
 | `/audit` | Anyone | Show last 10 audit log entries |
+| `/feed add <url> [channel] [role]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role |
+| `/feed remove <feed>` | RSS admins | Stop posting a feed |
+| `/feed list` | RSS admins | Show all feeds and whether they're working |
+| `/feed test <feed>` | RSS admins | Post a feed's newest item now, to check the format |
 
 > **Note:** Commands are guild-scoped (registered per-server) for instant availability.
 > `/flag` and `/unmark` are restricted to members with `HELPER_ROLE_ID`.
+
+---
+
+## 📰 Feeds
+
+Skippy posts new items from RSS and Atom feeds (blogs, YouTube channels,
+release notes, ...) in a fixed set of feed channels (`FEED_CHANNELS`:
+#community-feed by default, #ms-blogs, #ms-status and #cve); `/feed add` offers
+only those. Members with the RSS admin role manage feeds with `/feed`.
+
+- Feeds are checked every 10 minutes (`FEED_POLL_MINUTES`), using conditional
+  requests so unchanged feeds cost almost nothing.
+- Adding a feed skips everything already in it; only new items are posted,
+  oldest first, at most 5 per check. Nothing is posted twice, even across
+  restarts.
+- Links are cleaned of tracking parameters, the same way chat links are.
+- A feed that fails for an hour is reported in the RSS audit channel
+  (`FEED_ALERT_CHANNEL_ID`), and again when it recovers.
+- Fetching follows the same rules as the link cleaner: public addresses only,
+  checked on every redirect, at most 5 MB, and no XML entity tricks.
 
 ---
 
@@ -182,6 +208,8 @@ Located at `SKIPPY_DB_PATH` if set (on the server: `/var/lib/skippy/followup.db`
 - **follow_ups** — one row per flagged event (status: `open` / `resolved` / `ignored`)
 - **user_scores** — running totals per user
 - **audit_log** — timestamped log of every significant action
+- **feeds** — one row per feed: URL, optional ping role, caching headers, health
+- **feed_items** — which items of each feed were already posted
 
 ---
 

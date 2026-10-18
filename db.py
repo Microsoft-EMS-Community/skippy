@@ -61,6 +61,30 @@ async def init_db():
                 message_link TEXT NOT NULL,
                 sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS feeds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT,
+                role_id TEXT,
+                added_by TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                etag TEXT,
+                last_modified TEXT,
+                last_checked TIMESTAMP,
+                last_error TEXT,
+                failures INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (url, channel_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS feed_items (
+                feed_id INTEGER NOT NULL,
+                item_key TEXT NOT NULL,
+                seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (feed_id, item_key)
+            );
         """)
         await db.commit()
 
@@ -490,3 +514,102 @@ async def cleanup_rss_activity(days: int = 30) -> int:
         )
         await db.commit()
         return cursor.rowcount
+
+
+# ──────────────────────────────────────────────
+# RSS/Atom feeds (/feed)
+# ──────────────────────────────────────────────
+
+async def add_feed(guild_id: str, channel_id: str, url: str, title: str,
+                   role_id: str | None, added_by: str) -> int:
+    """Insert a feed. Raises sqlite3.IntegrityError if the URL already posts to that channel."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO feeds (guild_id, channel_id, url, title, role_id, added_by)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (guild_id, channel_id, url, title, role_id, added_by)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_feeds(guild_id: str | None = None) -> list[dict]:
+    """Return all feeds, or one guild's feeds."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if guild_id is None:
+            cursor = await db.execute("SELECT * FROM feeds ORDER BY id")
+        else:
+            cursor = await db.execute("SELECT * FROM feeds WHERE guild_id = ? ORDER BY id", (guild_id,))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_feed(feed_id: int, guild_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM feeds WHERE id = ? AND guild_id = ?", (feed_id, guild_id)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def remove_feed(feed_id: int, guild_id: str) -> bool:
+    """Delete a feed and its posted-item history. Returns False if it didn't exist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM feeds WHERE id = ? AND guild_id = ?", (feed_id, guild_id)
+        )
+        if cursor.rowcount:
+            await db.execute("DELETE FROM feed_items WHERE feed_id = ?", (feed_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_seen_feed_items(feed_id: int) -> set[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT item_key FROM feed_items WHERE feed_id = ?", (feed_id,))
+        return {row[0] for row in await cursor.fetchall()}
+
+
+async def mark_feed_items_seen(feed_id: int, keys: list[str], forget_after_days: int = 90):
+    """Remember items as posted (or deliberately skipped). Items still in the
+    feed are refreshed on every check; ones that left it are forgotten after
+    `forget_after_days` so the table doesn't grow forever."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """INSERT INTO feed_items (feed_id, item_key) VALUES (?, ?)
+               ON CONFLICT(feed_id, item_key) DO UPDATE SET seen_at = CURRENT_TIMESTAMP""",
+            [(feed_id, key) for key in keys]
+        )
+        await db.execute(
+            "DELETE FROM feed_items WHERE feed_id = ? AND seen_at < datetime('now', ?)",
+            (feed_id, f"-{forget_after_days} days")
+        )
+        await db.commit()
+
+
+async def record_feed_check(feed_id: int, error: str | None, etag: str | None = None,
+                            last_modified: str | None = None, title: str | None = None) -> int:
+    """Store a check's outcome. Success resets the failure count and saves the
+    caching headers; an error increments it. Returns the new failure count."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if error is None:
+            await db.execute(
+                """UPDATE feeds SET last_checked = CURRENT_TIMESTAMP, last_error = NULL, failures = 0,
+                       etag = COALESCE(?, etag), last_modified = COALESCE(?, last_modified),
+                       title = COALESCE(NULLIF(?, ''), title)
+                   WHERE id = ?""",
+                (etag, last_modified, title, feed_id)
+            )
+        else:
+            await db.execute(
+                """UPDATE feeds SET last_checked = CURRENT_TIMESTAMP, last_error = ?, failures = failures + 1
+                   WHERE id = ?""",
+                (error, feed_id)
+            )
+        await db.commit()
+        cursor = await db.execute("SELECT failures FROM feeds WHERE id = ?", (feed_id,))
+        row = await cursor.fetchone()
+        return row[0] if row else 0

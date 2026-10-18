@@ -1149,6 +1149,7 @@ async def main():
 
         await bot.load_extension("commands")  # Slash commands
         await bot.load_extension("tasks")     # Background warning task
+        await bot.load_extension("feeds")     # /feed commands + RSS/Atom poller
         await bot.start(BOT_TOKEN)
 
 
