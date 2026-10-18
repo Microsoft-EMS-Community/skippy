@@ -36,6 +36,7 @@ def rss(*keys):
 class FakeChannel:
     def __init__(self, channel_id=CHANNEL_ID):
         self.id, self.sent, self.fail_on, self.threads = channel_id, [], set(), []
+        self.mention = f"<#{channel_id}>"
         self.thread_error = None
 
     async def send(self, content, allowed_mentions=None):
@@ -220,6 +221,25 @@ class CommunityTests(FeedTestCase):
         self.assertEqual(len(self.channel.sent), 3)  # e was still posted ...
         self.assertIn("e", await db.get_seen_feed_items(self.feed_id))  # ... and counted as posted
 
+
+    async def test_add_with_post_latest_posts_newest_without_pings(self):
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        _, items = feed_reader.parse_feed(rss("new", "old").data)
+        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel))
+        i = interaction()
+        await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed", post_latest=True)
+        self.assertEqual(len(self.channel.sent), 1)
+        content, mentions = self.channel.sent[0]
+        self.assertTrue(content.startswith("<@&42> Blog - Post new · by <@77>\n"))  # looks like a normal post ...
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)   # ... but pings nobody
+        self.assertEqual([r["title"] for r in await db.search_feed_posts(["new"])], ["Post new"])
+        self.assertIn("Posted its newest item", i.followup.send.await_args.args[0])
+
+    async def test_add_without_post_latest_posts_nothing(self):
+        _, items = feed_reader.parse_feed(rss("new", "old").data)
+        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel))
+        await feeds.FeedCommands.feed_add.callback(self.cog, interaction(), "https://example.com/feed")
+        self.assertEqual(self.channel.sent, [])
 
 def interaction(user_id="500", mod=True):
     i = mock.Mock()

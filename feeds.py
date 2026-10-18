@@ -127,7 +127,7 @@ class FeedCommands(commands.Cog):
     async def _create_feed(self, guild: discord.Guild, url: str, channel_id: int, role_id: str | None,
                            author_id: str | None, added_by: str):
         """Check and add a feed; shared by /feed add and approving a suggestion.
-        Returns (feed id, title, number of current items, channel). Raises
+        Returns (feed id, title, current items, channel). Raises
         FeedError with a message for mods, or sqlite3.IntegrityError if the
         URL already posts in that channel."""
         channel = guild.get_channel(channel_id) if channel_id in FEED_CHANNELS.values() else None
@@ -146,7 +146,7 @@ class FeedCommands(commands.Cog):
         await db.record_feed_check(feed_id, None, result.etag, result.last_modified, title)
         if author_id:
             await self._link_author(feed_id, str(guild.id), author_id, added_by)
-        return feed_id, title, len(items), channel
+        return feed_id, title, items, channel
 
     @staticmethod
     async def _link_author(feed_id: int, guild_id: str, author_id: str, linked_by: str):
@@ -160,14 +160,16 @@ class FeedCommands(commands.Cog):
     @app_commands.describe(url="The RSS or Atom feed URL",
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
                            role="Optional role to ping with every post",
-                           author="The member who writes it: credited and pinged on posts, and activity-tracked")
+                           author="The member who writes it: credited and pinged on posts, and activity-tracked",
+                           post_latest="Post its newest item right away, without pings (off: skip what's there now)")
     @app_commands.choices(channel=CHANNEL_CHOICES)
     @is_rss_admin()
     async def feed_add(self, interaction: discord.Interaction, url: str, channel: str | None = None,
-                       role: discord.Role | None = None, author: discord.Member | None = None):
+                       role: discord.Role | None = None, author: discord.Member | None = None,
+                       post_latest: bool = False):
         await interaction.response.defer(ephemeral=True)
         try:
-            feed_id, title, count, target = await self._create_feed(
+            feed_id, title, items, target = await self._create_feed(
                 interaction.guild, url, int(channel) if channel else DEFAULT_CHANNEL_ID,
                 str(role.id) if role else None, str(author.id) if author else None, str(interaction.user.id))
         except FeedError as e:
@@ -183,9 +185,18 @@ class FeedCommands(commands.Cog):
                          "so posts will show the role without pinging anyone.")
         if author:
             notes.append(f"\n👤 Posts credit {author.mention}, who's now on the RSS watchlist.")
+        newest = feed_reader.select_new(items, set(), 1) if post_latest else []
+        if newest:
+            # The newest item as a real post (archived, credited, threaded),
+            # just without pings: a visible sign the feed is connected.
+            row = await db.get_feed(feed_id, str(interaction.guild_id))
+            if await self._post(target, row, title, newest, ping=False):
+                notes.append(f"\n📮 Posted its newest item in {target.mention}.")
+            else:
+                notes.append("\n⚠️ Couldn't post its newest item; see the bot's log.")
         await interaction.followup.send(
             f"✅ Added feed #{feed_id} **{discord.utils.escape_markdown(title or url)}** → {target.mention}. "
-            f"Its {count} current items are skipped; new ones are posted within {FEED_POLL_MINUTES} minutes. "
+            f"Its {len(items)} current items are skipped; new ones are posted within {FEED_POLL_MINUTES} minutes. "
             f"Preview the format with `/feed test feed:{feed_id}`, and set filters with `/feed edit`."
             + "".join(notes),
             ephemeral=True)
@@ -521,7 +532,7 @@ class FeedCommands(commands.Cog):
             logger.info("Feed #%s: %d new, %d filtered out, %d posted",
                         feed["id"], len(new), len(new) - len(to_post), len(posted))
 
-    async def _post(self, channel, feed: dict, name: str, items: list) -> set[str]:
+    async def _post(self, channel, feed: dict, name: str, items: list, ping: bool = True) -> set[str]:
         """Post items one by one, or as one summary when there are more than
         the feed's summary_after. Archives what was posted and returns its keys."""
         if not items:
@@ -529,8 +540,8 @@ class FeedCommands(commands.Cog):
         role_id, author_id = feed["role_id"], feed["author_id"]
         # Only the feed's own role and author can be pinged, never anyone else.
         mentions = discord.AllowedMentions(everyone=False,
-                                           users=[discord.Object(int(author_id))] if author_id else False,
-                                           roles=[discord.Object(int(role_id))] if role_id else False)
+                                           users=[discord.Object(int(author_id))] if author_id and ping else False,
+                                           roles=[discord.Object(int(role_id))] if role_id and ping else False)
         posted, archive = set(), []
         try:
             if len(items) > feed["summary_after"]:

@@ -171,7 +171,7 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/unmark @user` | Helpers only | Remove 🔴 role, resolve all open follow-ups, log action |
 | `/score @user` | Anyone | Show flag_count, resolved_count, open_count, avg resolution time |
 | `/audit` | Anyone | Show last 10 audit log entries |
-| `/feed add <url> [channel] [role] [author]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role |
+| `/feed add <url> [channel] [role] [author] [post_latest]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role; `post_latest` posts its newest item right away (no pings), a quick sign it's connected |
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
 | `/feed edit <feed> [...]` | RSS admins | Change a feed's channel, role, word filters or summary threshold; with just a feed, show its settings |
