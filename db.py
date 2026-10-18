@@ -96,6 +96,22 @@ async def init_db():
                 posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS feed_posts_posted_at ON feed_posts (posted_at);
+
+            CREATE TABLE IF NOT EXISTS feed_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT,
+                suggested_by TEXT NOT NULL,
+                own_blog INTEGER NOT NULL DEFAULT 1,
+                note TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',   -- pending / approved / rejected
+                decided_by TEXT,
+                reason TEXT,
+                message_id TEXT,                          -- the mods' card with the buttons
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                decided_at TIMESTAMP
+            );
         """)
         # Columns added after the feeds table first shipped; add them to
         # databases created before that.
@@ -104,6 +120,7 @@ async def init_db():
             "exclude_words": "TEXT",
             "highlight_words": "TEXT",
             "summary_after": "INTEGER NOT NULL DEFAULT 5",
+            "author_id": "TEXT",
         })
         await db.commit()
 
@@ -643,7 +660,7 @@ async def record_feed_check(feed_id: int, error: str | None, etag: str | None = 
 
 
 FEED_SETTINGS = ("channel_id", "role_id", "include_words", "exclude_words",
-                 "highlight_words", "summary_after")
+                 "highlight_words", "summary_after", "author_id")
 
 
 async def update_feed(feed_id: int, guild_id: str, **settings) -> bool:
@@ -692,3 +709,77 @@ async def search_feed_posts(words: list[str], limit: int = 10) -> list[dict]:
             (*params, limit)
         )
         return [dict(r) for r in await cursor.fetchall()]
+
+
+async def feed_url_tracked(guild_id: str, url: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM feeds WHERE guild_id = ? AND url = ? LIMIT 1", (guild_id, url)
+        )
+        return await cursor.fetchone() is not None
+
+
+# ──────────────────────────────────────────────
+# Feed suggestions (/feed suggest)
+# ──────────────────────────────────────────────
+
+async def add_suggestion(guild_id: str, url: str, title: str, suggested_by: str,
+                         own_blog: bool, note: str | None) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO feed_suggestions (guild_id, url, title, suggested_by, own_blog, note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (guild_id, url, title, suggested_by, int(own_blog), note)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def set_suggestion_message(suggestion_id: int, message_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE feed_suggestions SET message_id = ? WHERE id = ?", (message_id, suggestion_id)
+        )
+        await db.commit()
+
+
+async def get_suggestion(suggestion_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM feed_suggestions WHERE id = ?", (suggestion_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def pending_suggestions(guild_id: str, url: str | None = None,
+                              suggested_by: str | None = None) -> list[dict]:
+    query, params = "SELECT * FROM feed_suggestions WHERE guild_id = ? AND status = 'pending'", [guild_id]
+    if url:
+        query += " AND url = ?"
+        params.append(url)
+    if suggested_by:
+        query += " AND suggested_by = ?"
+        params.append(suggested_by)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(query + " ORDER BY id", params)
+        return [dict(r) for r in await cursor.fetchall()]
+
+
+async def decide_suggestion(suggestion_id: int, status: str, decided_by: str | None,
+                            reason: str | None = None) -> bool:
+    """Move a suggestion out of (or, with status 'pending', back into) the
+    queue. Deciding only succeeds while it's pending, so two mods clicking at
+    once can't both act on it. Returns whether this call changed it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if status == "pending":
+            cursor = await db.execute(
+                """UPDATE feed_suggestions SET status = 'pending', decided_by = NULL, reason = NULL,
+                       decided_at = NULL WHERE id = ?""", (suggestion_id,))
+        else:
+            cursor = await db.execute(
+                """UPDATE feed_suggestions SET status = ?, decided_by = ?, reason = ?,
+                       decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'""",
+                (status, decided_by, reason, suggestion_id))
+        await db.commit()
+        return cursor.rowcount > 0

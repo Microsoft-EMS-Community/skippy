@@ -171,11 +171,12 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/unmark @user` | Helpers only | Remove 🔴 role, resolve all open follow-ups, log action |
 | `/score @user` | Anyone | Show flag_count, resolved_count, open_count, avg resolution time |
 | `/audit` | Anyone | Show last 10 audit log entries |
-| `/feed add <url> [channel] [role]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role |
+| `/feed add <url> [channel] [role] [author]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role |
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
 | `/feed edit <feed> [...]` | RSS admins | Change a feed's channel, role, word filters or summary threshold; with just a feed, show its settings |
-| `/feed search <words>` | Anyone | Search everything the feeds have posted |
+| `/blog search <words>` | Anyone | Search everything the feeds have posted |
+| `/blog suggest <url> [own_blog] [note]` | Anyone | Suggest a blog; mods approve or reject it with a button |
 | `/feed test <feed>` | RSS admins | Post a feed's newest item now, to check the format |
 
 > **Note:** Commands are guild-scoped (registered per-server) for instant availability.
@@ -204,12 +205,32 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   "highlight" (e.g. Remote Code Execution) are listed first, in bold.
 - Per-feed word filters (`/feed edit`): "exclude" words are never posted
   (e.g. Chromium), and "include" words limit a feed to matching titles.
-- Everything posted is archived, and anyone can search it with `/feed search`.
+- Everything posted is archived, and anyone can search it with `/blog search`.
 - Links are cleaned of tracking parameters, the same way chat links are.
 - A feed that fails for an hour is reported in the RSS audit channel
   (`FEED_ALERT_CHANNEL_ID`), and again when it recovers.
 - Fetching follows the same rules as the link cleaner: public addresses only,
   checked on every redirect, at most 5 MB, and no XML entity tricks.
+
+---
+
+### Community
+
+- **Suggestions:** members run `/blog suggest <feed url>`. Skippy checks it's a
+  readable feed that isn't tracked yet, then posts a card in the RSS audit
+  channel (`FEED_SUGGESTIONS_CHANNEL_ID`) with **Approve** and **Reject**
+  buttons for moderators. Approving adds the feed to #community-feed
+  (credited to the member if it's their own blog); rejecting asks for an
+  optional reason. Either way the member gets a DM. Each member can have at
+  most 3 suggestions waiting.
+- **Author credit:** a feed linked to a member (`author` on `/feed add` or
+  `/feed edit`) shows "· by @member" on every post and pings them, and puts
+  them on the RSS watchlist so their server activity is tracked.
+- **Discussion threads:** posts in #community-feed (`FEED_THREAD_CHANNEL_IDS`)
+  get a thread on the post itself, named after the article.
+- `/feed` is only shown to members with Manage Roles (the Moderator role);
+  everyone gets `/blog`. Server admins can change visibility under Server
+  Settings → Integrations → Skippy.
 
 ---
 
@@ -222,7 +243,8 @@ Located at `SKIPPY_DB_PATH` if set (on the server: `/var/lib/skippy/followup.db`
 - **audit_log** — timestamped log of every significant action
 - **feeds** — one row per feed: URL, optional ping role, caching headers, health
 - **feed_items** — which items of each feed were already posted
-- **feed_posts** — archive of everything posted (title, link, message), for `/feed search`
+- **feed_posts** — archive of everything posted (title, link, message), for `/blog search`
+- **feed_suggestions** — `/blog suggest` queue: who suggested what, and the mods' decision
 
 ---
 

@@ -34,17 +34,27 @@ def rss(*keys):
 
 
 class FakeChannel:
-    def __init__(self):
-        self.sent, self.fail_on = [], set()
+    def __init__(self, channel_id=CHANNEL_ID):
+        self.id, self.sent, self.fail_on, self.threads = channel_id, [], set(), []
+        self.thread_error = None
 
     async def send(self, content, allowed_mentions=None):
         if any(f"/{k}\n" in content + "\n" for k in self.fail_on):
             raise discord.HTTPException(mock.Mock(status=503, reason="unavailable"), "down")
         self.sent.append((content, allowed_mentions))
-        return mock.Mock(jump_url=f"https://discord.com/channels/1/{CHANNEL_ID}/{len(self.sent)}")
+
+        async def create_thread(name, auto_archive_duration):
+            if self.thread_error:
+                raise self.thread_error
+            self.threads.append(name)
+
+        return mock.Mock(jump_url=f"https://discord.com/channels/1/{self.id}/{len(self.sent)}",
+                         create_thread=create_thread)
 
 
-class FeedPollTests(unittest.IsolatedAsyncioTestCase):
+class FeedTestCase(unittest.IsolatedAsyncioTestCase):
+    """A fresh database with one feed (#1, role 42) and a fake channel."""
+
     async def asyncSetUp(self):
         if os.path.exists(os.environ["SKIPPY_DB_PATH"]):
             os.remove(os.environ["SKIPPY_DB_PATH"])
@@ -68,6 +78,8 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
     def posted(self):
         return [content.rsplit("/", 1)[1] for content, _ in self.channel.sent]
 
+
+class FeedPollTests(FeedTestCase):
     async def test_only_new_items_post_oldest_first_with_role_ping(self):
         await self.check(rss("a", "b"))
         self.assertEqual(self.posted(), [])
@@ -176,6 +188,110 @@ class FeedPollTests(unittest.IsolatedAsyncioTestCase):
             await feeds.FeedCommands.poll.coro(self.cog)
         self.assertEqual(sorted(checked), list(range(12)))
         self.assertEqual(peak, feeds.CONCURRENT_CHECKS)
+
+
+class CommunityTests(FeedTestCase):
+
+    async def test_author_is_credited_and_pinged(self):
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await self.check(rss("c", "a", "b"))
+        content, mentions = self.channel.sent[0]
+        self.assertTrue(content.startswith("<@&42> Blog - Post c · by <@77>\n"))
+        self.assertEqual([u.id for u in mentions.users], [77])
+
+    async def test_linking_an_author_watches_them_without_resetting_history(self):
+        await db.add_to_watchlist("77", "1", "9")
+        await db.log_rss_activity("77", "1", "5", "6", "https://discord.com/channels/1/5/6")
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "10")
+        self.assertTrue(await db.is_watched("77"))
+        self.assertEqual(await db.get_rss_activity_count("77"), 1)
+        self.assertEqual((await db.get_feed(self.feed_id, "1"))["author_id"], "77")
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "88", "10")
+        self.assertTrue(await db.is_watched("88"))
+
+    async def test_threads_only_in_thread_channels_and_never_block_posting(self):
+        await self.check(rss("c", "a", "b"))
+        self.assertEqual(self.channel.threads, [])  # 111 isn't a thread channel
+        with mock.patch.object(feeds, "FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}):
+            await self.check(rss("d", "c", "a", "b"))
+            self.assertEqual(self.channel.threads, ["Post d"])
+            self.channel.thread_error = discord.HTTPException(mock.Mock(status=403, reason="no"), "Missing Permissions")
+            await self.check(rss("e", "d", "c", "a", "b"))
+        self.assertEqual(len(self.channel.sent), 3)  # e was still posted ...
+        self.assertIn("e", await db.get_seen_feed_items(self.feed_id))  # ... and counted as posted
+
+
+def interaction(user_id="500", mod=True):
+    i = mock.Mock()
+    i.user = mock.Mock(id=int(user_id), mention=f"<@{user_id}>",
+                       roles=[mock.Mock(id=feeds.RSS_ADMIN_ROLE_ID)] if mod else [])
+    i.guild, i.guild_id = mock.Mock(id=1), 1
+    i.response.defer = mock.AsyncMock()
+    i.response.send_message = mock.AsyncMock()
+    i.followup.send = mock.AsyncMock()
+    i.message = mock.Mock(id=999, embeds=[discord.Embed(title="📬 Feed suggestion")], edit=mock.AsyncMock())
+    return i
+
+
+class SuggestionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        if os.path.exists(os.environ["SKIPPY_DB_PATH"]):
+            os.remove(os.environ["SKIPPY_DB_PATH"])
+        await db.init_db()
+        self.cog = feeds.FeedCommands.__new__(feeds.FeedCommands)
+        self.cog.bot = mock.Mock()
+        self.cog._dm = mock.AsyncMock()
+        self.sid = await db.add_suggestion("1", "https://blog.example/feed", "My Blog", "300", True, None)
+        self.channel = mock.Mock(mention="<#community>")
+        self.cog._create_feed = mock.AsyncMock(return_value=(7, "My Blog", 3, self.channel))
+
+    async def test_approve_adds_feed_credits_author_and_tells_everyone(self):
+        i = interaction()
+        await self.cog.approve_suggestion(i, self.sid)
+        self.cog._create_feed.assert_awaited_once_with(i.guild, "https://blog.example/feed",
+                                                       feeds.DEFAULT_CHANNEL_ID, None, "300", "500")
+        suggestion = await db.get_suggestion(self.sid)
+        self.assertEqual((suggestion["status"], suggestion["decided_by"]), ("approved", "500"))
+        card = i.message.edit.await_args.kwargs
+        self.assertIsNone(card["view"])  # buttons removed
+        self.assertIn("Approved by <@500>: feed #7", card["embed"].fields[-1].value)
+        self.assertIn("approved", self.cog._dm.await_args.args[1])
+
+    async def test_not_own_blog_gets_no_author(self):
+        sid = await db.add_suggestion("1", "https://other.example/feed", "Other", "300", False, None)
+        await self.cog.approve_suggestion(interaction(), sid)
+        self.assertIsNone(self.cog._create_feed.await_args.args[4])
+
+    async def test_second_mod_cannot_decide_again(self):
+        await self.cog.approve_suggestion(interaction("500"), self.sid)
+        late = interaction("501")
+        await self.cog.reject_suggestion(late, self.sid, "nope")
+        self.assertIn("already decided", late.response.send_message.await_args.args[0])
+        self.assertEqual((await db.get_suggestion(self.sid))["status"], "approved")
+
+    async def test_failed_approval_goes_back_to_the_queue(self):
+        self.cog._create_feed.side_effect = feeds.FeedError("HTTP 404")
+        i = interaction()
+        await self.cog.approve_suggestion(i, self.sid)
+        self.assertEqual((await db.get_suggestion(self.sid))["status"], "pending")
+        self.assertIn("HTTP 404", i.followup.send.await_args.args[0])
+        i.message.edit.assert_not_awaited()  # card and buttons untouched
+
+    async def test_reject_with_reason(self):
+        i = interaction()
+        await self.cog.reject_suggestion(i, self.sid, "Not about Microsoft tech")
+        suggestion = await db.get_suggestion(self.sid)
+        self.assertEqual((suggestion["status"], suggestion["reason"]), ("rejected", "Not about Microsoft tech"))
+        self.assertIn("Rejected by <@500>: Not about Microsoft tech", i.message.edit.await_args.kwargs["embed"].fields[-1].value)
+        self.assertIn("Reason: Not about Microsoft tech", self.cog._dm.await_args.args[1])
+
+    async def test_buttons_only_work_for_mods(self):
+        button = feeds.SuggestionButton("approve", self.sid)
+        self.assertEqual(button.item.custom_id, f"feed-suggestion:approve:{self.sid}")
+        self.assertTrue(await button.interaction_check(interaction(mod=True)))
+        member = interaction(mod=False)
+        self.assertFalse(await button.interaction_check(member))
+        self.assertIn("can decide on suggestions", member.response.send_message.await_args.args[0])
 
 
 class MigrationTests(unittest.IsolatedAsyncioTestCase):
