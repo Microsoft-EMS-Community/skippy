@@ -46,6 +46,18 @@ DB_PATH = os.environ.get("SKIPPY_DB_PATH") or os.path.join(
 RSS_ADMIN_ROLE_ID = 1008083497291874304   # Role that can use /rsswatch commands
 RSS_AUDIT_CHANNEL_ID = 1438251870106947806  # Channel where RSS reports are posted
 
+# RSS/Atom feed posting (/feed commands, managed by RSS_ADMIN_ROLE_ID)
+# The only channels feeds may post in: /feed add offers exactly these.
+# The first one is the default.
+FEED_CHANNELS = {
+    "community-feed": 1010964682741387354,
+    "ms-blogs": 1010929103978897448,
+    "ms-status": 1105424571798126652,
+    "cve": 1312419690802450453,
+}
+FEED_POLL_MINUTES = 5                         # How often every feed is checked
+FEED_ALERT_CHANNEL_ID = RSS_AUDIT_CHANNEL_ID  # Where failing feeds are reported
+
 # New Account heuristic tagging
 NEW_ACCOUNT_ROLE_ID = 1534323968591532083   # 🆕 auto-assigned on join if heuristics trip
 NEW_ACCOUNT_AGE_DAYS = 7                    # Account younger than this trips the heuristic

@@ -43,9 +43,12 @@ LockPersonality=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# Defence in depth for link_cleaner's SSRF checks: Azure metadata/WireServer,
-# link-local and private ranges. Loopback stays open for the DNS stub resolver.
-IPAddressDeny=169.254.0.0/16 168.63.129.16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10
+# Defence in depth for the SSRF checks in link_cleaner and feed_reader:
+# Azure metadata/WireServer, link-local and private ranges, and loopback
+# (other services listen there) except systemd-resolved's DNS stub, which
+# IPAddressAllow lets through (allow wins over deny).
+IPAddressAllow=127.0.0.53
+IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 168.63.129.16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10
 UMask=0077
 
 [Install]
