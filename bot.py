@@ -15,12 +15,12 @@ import asyncio
 
 import db
 import views as v
+import followup_notify
 import link_cleaner
 from config import (
     BOT_TOKEN,
     GUILD_ID,
     AWAITING_ROLE_ID,
-    FOLLOWUP_CHANNEL_ID,
     HELPER_LOG_CHANNEL_ID,
     HELPER_ROLE_IDS,
     FLAG_EMOJI,
@@ -270,7 +270,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
       1. Verify the reactor has the HELPER_ROLE_ID
       2. Add the 🔴 Awaiting Follow-up role to the message author
       3. Log to DB with the exact message as context (no searching needed)
-      4. Ping the user in FOLLOWUP_CHANNEL_ID
+      4. Reply on the flagged message to tell the user (DM if that fails)
     """
     # Ignore DMs and bot reactions
     if payload.guild_id is None:
@@ -371,15 +371,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     helper_log = guild.get_channel(HELPER_LOG_CHANNEL_ID)
 
     if not already_flagged:
-        # First flag - ping the user so they know
-        followup_channel = guild.get_channel(FOLLOWUP_CHANNEL_ID)
-        if followup_channel:
-            await followup_channel.send(
-                f"Hey {target_member.mention}, a helper has flagged one of your messages for follow-up.\n"
-                f"🔗 {message_link}\n"
-                f"Please **reply directly to that message** to close the follow-up. "
-                f"A helper will remove the flag once they see your response."
-            )
+        # First flag - tell the user, right on the flagged message
+        await followup_notify.notify_member(
+            guild, target_member, message_link,
+            reply_text=(
+                f"Hey {target_member.mention}, a helper has flagged this message for follow-up. "
+                f"Please **reply to this message** to close it; a helper will remove the flag "
+                f"once they see your response."
+            ),
+            dm_text=(
+                f"Hey! A helper in {guild.name} has flagged one of your messages for follow-up:\n"
+                f"🔗 {message_link}\nPlease **reply directly to that message** to close it."
+            ),
+            message=message,
+        )
         if helper_log:
             embed = await make_embed(
                 title="🔴 Flagged",

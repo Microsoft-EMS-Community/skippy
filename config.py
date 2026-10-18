@@ -20,7 +20,6 @@ AWAITING_ROLE_ID = 1473695101996761200   # 🔴 "Awaiting Follow-up" role
 FOLLOWSUP_ROLE_ID = 1473694869863010407  # ✅ "Follows Up" role (optional, for tracking)
 
 # Channel IDs - enable Developer Mode, right-click a channel → "Copy Channel ID"
-FOLLOWUP_CHANNEL_ID = 1473843480278339656   # Where follow-up pings are posted to users
 HELPER_LOG_CHANNEL_ID = 1473843359930908693 # Where helper/mod audit logs are posted
 
 # Helper roles - only members with one of these roles can flag users (via reaction or /flag)

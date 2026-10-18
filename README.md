@@ -64,7 +64,6 @@ You need:
 1. Right-click any text channel → **Copy Channel ID**
 
 You need:
-- **FOLLOWUP_CHANNEL_ID** — where follow-up pings are sent to users
 - **HELPER_LOG_CHANNEL_ID** — where helper/mod logs appear
 
 ---
@@ -78,7 +77,6 @@ BOT_TOKEN = "your-bot-token-here"
 GUILD_ID = 1234567890               # Your server ID
 AWAITING_ROLE_ID = 1234567890       # 🔴 Awaiting Follow-up role ID
 FOLLOWSUP_ROLE_ID = 1234567890      # ✅ Follows Up role ID
-FOLLOWUP_CHANNEL_ID = 1234567890    # Channel for user pings
 HELPER_LOG_CHANNEL_ID = 1234567890  # Channel for helper logs
 HELPER_ROLE_ID = 1234567890         # Helper/mod role (can flag users)
 FLAG_EMOJI = "🔴"                   # Emoji helpers react with to flag
@@ -137,7 +135,7 @@ A helper reacts with the `FLAG_EMOJI` (default 🔴) directly on the user's mess
 - Bot verifies the reactor has `HELPER_ROLE_ID`
 - Adds the 🔴 role to the message author automatically
 - Captures the exact message as context (no searching needed)
-- Pings the user in `FOLLOWUP_CHANNEL_ID` with a direct link
+- Replies on that message to tell the user (or DMs them if it can't)
 
 **Backup — `/flag @user [reason]`:**
 Use when you can't react to a specific message (e.g. old threads, mobile edge cases).
@@ -147,7 +145,7 @@ Use when you can't react to a specific message (e.g. old threads, mobile edge ca
 When the 🔴 role is added (via reaction, `/flag`, or manually):
 1. Bot logs the event to SQLite (user, channel, message link, snippet)
 2. Increments the user's `flag_count`
-3. Pings the user in `FOLLOWUP_CHANNEL_ID`
+3. Tells the user with a reply on the flagged message (a DM if the message is gone)
 
 ### New Message from Flagged User
 When a member with 🔴 role posts in any non-bot channel:
@@ -155,8 +153,8 @@ When a member with 🔴 role posts in any non-bot channel:
 2. DMs or pings the user to resolve their open follow-ups first
 
 ### Warning Progression (every 24h)
-- **> 48 hours**: Sends a reminder ping in `FOLLOWUP_CHANNEL_ID` (once)
-- **> 7 days**: Marks follow-up as `ignored` in the database
+- **> 48 hours**: Replies on the flagged message with a reminder (once; a DM if the message is gone)
+- **> 7 days**: Marks follow-up as `ignored` in the database, and notes it in the helper log
 
 ### Role Removed (🔴 removed)
 - Marks all open follow-ups as resolved in SQLite
