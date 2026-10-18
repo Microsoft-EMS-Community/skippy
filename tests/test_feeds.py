@@ -63,7 +63,7 @@ class FakeChannel:
             self.votes_added.append((message_id, emoji))
 
         message = mock.Mock(id=message_id, jump_url=f"https://discord.com/channels/1/{self.id}/{message_id}",
-                            create_thread=create_thread, add_reaction=add_reaction, reactions=[])
+                            create_thread=create_thread, add_reaction=add_reaction, reactions=[], channel=self)
         self.messages[message_id] = message
         return message
 
@@ -507,6 +507,68 @@ class FeedNameTests(FeedTestCase):
         self.assertEqual((await db.get_feed(self.feed_id, "1"))["display_name"], "CirriusTech")
         await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id, clear="display_name")
         self.assertEqual(feeds.feed_name(await db.get_feed(self.feed_id, "1")), "Blog")
+
+
+class ConsistentPostsTests(FeedTestCase):
+    """Every post in #community-feed gets the vote emoji and a thread, however it was posted."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        for name, value in (("FEED_ROUNDUP_CHANNEL_ID", CHANNEL_ID), ("FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}),
+                            ("FEED_VOTE_EMOJI", "👍")):
+            patcher = mock.patch.object(feeds, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def test_feed_test_posts_like_any_other_post(self):
+        i = interaction()
+        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("new", "old"))):
+            await feeds.FeedCommands.feed_test.callback(self.cog, i, self.feed_id)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(len(self.channel.votes_added), 1)
+        self.assertEqual(self.channel.threads, ["Post new"])
+        self.assertFalse(self.channel.sent[0][1].roles)  # still no pings for a test
+        self.assertEqual([r["title"] for r in await db.search_feed_posts(["new"])], ["Post new"])  # archived
+        self.assertIn("test-posted feed #1 **Blog**", self.alerts.sent[-1][0])  # mods see it
+
+    async def test_summary_gets_a_thread_but_no_vote(self):
+        await self.check(rss(*[f"n{i}" for i in range(8, 0, -1)]))
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(self.channel.votes_added, [])
+        self.assertEqual(self.channel.threads, ["Blog - 8 new posts"])
+
+    async def test_mod_actions_are_audited_in_discord_and_the_audit_log(self):
+        await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id, name="Skippy Blog",
+                                                    exclude="chromium")
+        self.assertEqual(self.alerts.sent[-1][0], "🛠️ <@500> edited feed #1 **Skippy Blog**: name, exclude words")
+        self.assertFalse(self.alerts.sent[-1][1].users)  # mentioned, not pinged
+        entry = (await db.get_recent_audit_log(1))[0]
+        self.assertEqual((entry["action"], entry["actor_id"]), ("feed_edit", "500"))
+        await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id)  # just looking
+        self.assertEqual(len(self.alerts.sent), 1)
+        await feeds.FeedCommands.feed_remove.callback(self.cog, interaction(), self.feed_id)
+        self.assertEqual(self.alerts.sent[-1][0], "🛠️ <@500> removed feed #1 **Skippy Blog**")
+
+    async def test_an_article_posted_twice_shows_once(self):
+        await self.check(rss("c", "a", "b"))                     # message 1
+        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("c", "a", "b"))):
+            await feeds.FeedCommands.feed_test.callback(self.cog, interaction(), self.feed_id)  # message 2, same post
+        self.channel.vote(2, 501, 502)
+        posts = await db.roundup_posts(str(CHANNEL_ID))
+        self.assertEqual(len(posts), 2)
+        embed = feeds.build_roundup(posts, MONDAY_9, await self.cog._vote_counts(posts))
+        self.assertEqual(embed.description.count("[Post c]"), 1)
+        self.assertIn("· 2", embed.fields[0].value)  # the copy with the votes counts
+        i = interaction()
+        await feeds.FeedCommands.feed_search.callback(self.cog, i, "post c")
+        self.assertEqual(i.response.send_message.await_args.kwargs["embed"].description.count("[Post c]"), 1)
+
+
+class LogFileTests(unittest.TestCase):
+    def test_logs_live_next_to_the_database_and_keep_a_week(self):
+        import config
+        self.assertEqual(config.LOG_DIR, os.path.join(os.path.dirname(config.DB_PATH), "logs"))
+        self.assertEqual(config.LOG_DAYS, 7)
 
 def interaction(user_id="500", mod=True):
     i = mock.Mock()
