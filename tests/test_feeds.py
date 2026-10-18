@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -34,24 +35,49 @@ def rss(*keys):
     return FetchResult(f"<rss><channel><title>Blog</title>{items}</channel></rss>".encode(), None, None)
 
 
+SKIPPY_ID = 1473839815643369686
+
+
 class FakeChannel:
     def __init__(self, channel_id=CHANNEL_ID):
         self.id, self.sent, self.fail_on, self.threads = channel_id, [], set(), []
         self.mention = f"<#{channel_id}>"
+        self.embeds, self.votes_added, self.messages = [], [], {}
         self.thread_error = None
 
-    async def send(self, content, allowed_mentions=None):
+    async def send(self, content=None, allowed_mentions=None, embed=None):
+        if embed is not None:
+            self.embeds.append(embed)
+            return mock.Mock()
         if any(f"/{k}\n" in content + "\n" for k in self.fail_on):
             raise discord.HTTPException(mock.Mock(status=503, reason="unavailable"), "down")
         self.sent.append((content, allowed_mentions))
+        message_id = len(self.sent)
 
         async def create_thread(name, auto_archive_duration):
             if self.thread_error:
                 raise self.thread_error
             self.threads.append(name)
 
-        return mock.Mock(jump_url=f"https://discord.com/channels/1/{self.id}/{len(self.sent)}",
-                         create_thread=create_thread)
+        async def add_reaction(emoji):
+            self.votes_added.append((message_id, emoji))
+
+        message = mock.Mock(id=message_id, jump_url=f"https://discord.com/channels/1/{self.id}/{message_id}",
+                            create_thread=create_thread, add_reaction=add_reaction, reactions=[])
+        self.messages[message_id] = message
+        return message
+
+    async def fetch_message(self, message_id):
+        if message_id not in self.messages:
+            raise discord.NotFound(mock.Mock(status=404, reason="Not Found"), "Unknown Message")
+        return self.messages[message_id]
+
+    def vote(self, message_id, *user_ids, emoji="👍"):
+        """Give a posted message these users' reactions (Skippy's own included, as in Discord)."""
+        async def users():
+            for uid in (SKIPPY_ID, *user_ids):
+                yield mock.Mock(id=uid)
+        self.messages[message_id].reactions.append(mock.Mock(emoji=emoji, users=users))
 
 
 class FeedTestCase(unittest.IsolatedAsyncioTestCase):
@@ -66,6 +92,7 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
         bot.get_channel = lambda cid: {CHANNEL_ID: self.channel, ALERT_CHANNEL_ID: self.alerts}.get(cid)
         self.cog = feeds.FeedCommands.__new__(feeds.FeedCommands)  # skip __init__: no poll loop
         self.cog.bot = bot
+        bot.user = mock.Mock(id=SKIPPY_ID)
         self.cog.skip_until = {}
         self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/feed", "Blog", "42", "9")
         await db.mark_feed_items_seen(self.feed_id, ["a", "b"])  # what /feed add does
@@ -339,6 +366,121 @@ class ActivityRuleTests(FeedTestCase):
         embed = i.response.send_message.await_args.kwargs["embed"]
         self.assertEqual(embed.title, "Activity rule: watch")
         self.assertIn("🔴 <@77> · 0 msg · Blog", embed.description)
+
+
+def post(title, author_id=None, feed_id=1, feed_title="Blog"):
+    return {"title": title, "link": f"https://e.com/{title.replace(' ', '-')}", "feed_title": feed_title,
+            "posted_at": "2026-10-15 10:00:00", "feed_id": feed_id, "author_id": author_id, "message_url": None}
+
+
+MONDAY_9 = datetime(2026, 10, 19, 9, 0, tzinfo=feeds.ROUNDUP_TZ)
+
+
+class RoundupTests(FeedTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        for name, value in (("FEED_ROUNDUP_CHANNEL_ID", CHANNEL_ID), ("FEED_VOTE_EMOJI", "👍")):
+            patcher = mock.patch.object(feeds, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_build_groups_per_blogger_in_posting_order_with_a_vote_podium(self):
+        posts = [post("A1", "77"), post("B1", None, 2, "Some *Blog*"), post("A2", "77"), post("C1", "99", 3)]
+        for n, p in enumerate(posts):
+            p["message_url"] = f"https://discord.com/channels/1/{CHANNEL_ID}/{n}"
+        votes = {posts[3]["message_url"]: 5, posts[1]["message_url"]: 2, posts[0]["message_url"]: 2}
+        embed = feeds.build_roundup(posts, MONDAY_9, votes)
+        self.assertEqual(embed.title, "📰 Community roundup · week 42")
+        lines = embed.description.splitlines()
+        self.assertEqual(lines[0], "**4 new posts from 3 bloggers** this week. Thanks for writing! 💙")
+        self.assertEqual(lines[2:5], ["<@77>", "• [A1](<https://e.com/A1>)", "• [A2](<https://e.com/A2>)"])
+        self.assertIn("**Some \\*Blog\\***", embed.description)  # feeds without an author by name
+        self.assertEqual(embed.fields[0].name, "🏆 Community favourites this week")
+        self.assertEqual(embed.fields[0].value.splitlines(), [
+            "🥇 [C1](<https://e.com/C1>) by <@99> · 5 👍",
+            "🥈 [A1](<https://e.com/A1>) by <@77> · 2 👍",       # tie: the earlier post first
+            "🥉 [B1](<https://e.com/B1>) by **Some \\*Blog\\*** · 2 👍"])
+        self.assertIn("/blog suggest", embed.footer.text)
+
+    def test_no_votes_no_podium(self):
+        embed = feeds.build_roundup([post("A1", "77"), post("C1", "99", 3)], MONDAY_9, {})
+        self.assertEqual(embed.fields, [])
+
+    def test_build_quiet_week_and_single_blogger(self):
+        self.assertIsNone(feeds.build_roundup([], MONDAY_9))
+        embed = feeds.build_roundup([post("Only", "77")], MONDAY_9)
+        self.assertTrue(embed.description.startswith("**1 new post from 1 blogger**"))
+
+    def test_build_stays_within_discord_limits(self):
+        many = [post(f"Post number {n} " + "x" * 100, str(1000 + n % 30), n) for n in range(200)]
+        embed = feeds.build_roundup(many, MONDAY_9)
+        self.assertLessEqual(len(embed.description), 4096)
+        self.assertRegex(embed.description, r"…and \d+ more posts\.$")
+
+    async def test_query_is_this_channels_feeds_last_seven_days(self):
+        other = await db.add_feed("1", "222", "https://other.example/feed", "Other", None, "9")
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None),
+                                     (self.feed_id, "Blog", "Stale", "https://e.com/s", None),
+                                     (other, "Other", "Elsewhere", "https://e.com/x", None)])
+        async with aiosqlite.connect(db.DB_PATH) as c:
+            await c.execute("UPDATE feed_posts SET posted_at = datetime('now', '-8 days') WHERE title = 'Stale'")
+            await c.commit()
+        self.assertEqual([p["title"] for p in await db.roundup_posts(str(CHANNEL_ID))], ["Fresh"])
+
+    async def test_posts_monday_from_nine_once_per_week(self):
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 - timedelta(minutes=1)))
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=1)))  # Tuesday
+        self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(minutes=3)))
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(hours=2)))  # already out
+        self.assertEqual(len(self.channel.embeds), 1)
+        self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))  # next week
+
+    async def test_switched_off_or_quiet_posts_nothing(self):
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9))  # quiet week
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
+        await db.set_setting("feed_roundup", "off")
+        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))
+        self.assertEqual(self.channel.embeds, [])
+
+    async def test_posts_in_the_roundup_channel_get_the_vote_emoji(self):
+        await self.check(rss("c", "a", "b"))
+        self.assertEqual(self.channel.votes_added, [(1, "👍")])
+        with mock.patch.object(feeds, "FEED_ROUNDUP_CHANNEL_ID", 222):  # any other channel: no vote emoji
+            await self.check(rss("d", "c", "a", "b"))
+        self.assertEqual(len(self.channel.votes_added), 1)
+
+    async def test_votes_skip_skippy_and_the_author_and_summaries(self):
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await self.check(rss("c", "a", "b"))                     # message 1
+        await self.check(rss("e", "d", "c", "a", "b"))           # messages 2, 3
+        self.channel.vote(1, 77, 501, 502)                        # author's own vote doesn't count
+        self.channel.vote(3, 501)
+        self.channel.vote(3, 503, emoji="❤️")                     # other emoji don't count
+        await db.archive_feed_posts([(self.feed_id, "Blog", "S1", "https://e.com/s1", "https://discord.com/channels/1/111/9"),
+                                     (self.feed_id, "Blog", "S2", "https://e.com/s2", "https://discord.com/channels/1/111/9")])
+        posts = await db.roundup_posts(str(CHANNEL_ID))
+        votes = await self.cog._vote_counts(posts)
+        self.assertEqual(votes, {"https://discord.com/channels/1/111/1": 2, "https://discord.com/channels/1/111/3": 1})
+        embed = feeds.build_roundup(posts, MONDAY_9, votes)
+        self.assertTrue(embed.fields[0].value.startswith("🥇 [Post c]"))
+
+    def test_server_emoji_vote_matches_how_discord_shows_reactions(self):
+        # A custom emoji reaction's str() is "<:name:id>", the format FEED_VOTE_EMOJI uses.
+        from config import FEED_VOTE_EMOJI
+        self.assertEqual(str(discord.PartialEmoji.from_str(FEED_VOTE_EMOJI)), FEED_VOTE_EMOJI)
+
+    async def test_command_preview_post_and_switch(self):
+        await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
+        i = interaction()
+        await feeds.FeedCommands.feed_roundup.callback(self.cog, i)  # default: preview
+        self.assertTrue(i.followup.send.await_args.kwargs["ephemeral"])
+        self.assertEqual(self.channel.embeds, [])
+        await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="post")
+        self.assertEqual(len(self.channel.embeds), 1)
+        self.assertIsNotNone(await db.get_setting("feed_roundup_last_week"))  # Monday won't repeat it
+        await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="off")
+        self.assertEqual(await db.get_setting("feed_roundup"), "off")
 
 def interaction(user_id="500", mod=True):
     i = mock.Mock()
