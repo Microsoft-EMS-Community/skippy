@@ -10,6 +10,7 @@ from discord.ext import commands
 import datetime
 import db
 from config import GUILD_ID, AWAITING_ROLE_ID, FOLLOWUP_CHANNEL_ID, HELPER_ROLE_IDS, RSS_ADMIN_ROLE_ID, RSS_AUDIT_CHANNEL_ID
+from config import FEED_ROUNDUP_CHANNEL_ID, FEED_VOTE_EMOJI
 
 
 def is_helper():
@@ -261,7 +262,19 @@ class FollowUpCommands(commands.Cog):
                 "`/trial @user` - Put someone on trial for ghosting. Court is in session.\n"
                 "`/roulette` - Skippy picks today's most likely ghoster. Nobody is safe.\n"
                 "`/slap @user` - Slap someone. In the name of Skippy.\n"
+                "`/blog suggest <feed url>` - Suggest your blog for the community feed\n"
+                "`/blog search <words>` - Search everything the feeds have posted\n"
                 "`/help` - This message"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="Community feed",
+            value=(
+                f"New posts from the community's blogs land in <#{FEED_ROUNDUP_CHANNEL_ID}>, each with a "
+                "discussion thread. Vote for your favourites with "
+                f"{FEED_VOTE_EMOJI}: every Monday the roundup recaps the week and crowns the 3 most-voted posts."
             ),
             inline=False
         )
@@ -291,6 +304,22 @@ class FollowUpCommands(commands.Cog):
             ),
             inline=False
         )
+
+        # Feed management only shows up for the people who can use it.
+        if any(r.id == RSS_ADMIN_ROLE_ID for r in getattr(interaction.user, "roles", [])):
+            embed.add_field(
+                name="Moderators: feeds",
+                value=(
+                    "`/feed add <url> [channel] [role] [author]` - Add a feed; its newest post goes out right away\n"
+                    "`/feed edit <feed>` - Channel, ping role, author, word filters, summaries; no options shows them\n"
+                    "`/feed list` · `/feed test` · `/feed remove`\n"
+                    "`/feed activity [mode]` - Who's active; phase in off → watch → warn → enforce\n"
+                    "`/feed roundup [action]` - Preview the Monday roundup, post it now, or switch it off\n"
+                    f"`/blog suggest` cards land in <#{RSS_AUDIT_CHANNEL_ID}> with Approve/Reject buttons\n"
+                    "`/rsswatch` - Members' activity tracking (`/rsswatch help`)"
+                ),
+                inline=False
+            )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
