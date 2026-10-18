@@ -1,8 +1,17 @@
-# 🤖 Discord Follow-Up Bot
+<p align="center">
+  <img src="skippy-logo.png" alt="Skippy, a skeptical paperclip wearing a headset" width="160">
+</p>
 
-[![tests](https://github.com/Microsoft-EMS-Community/skippy/actions/workflows/tests.yml/badge.svg)](https://github.com/Microsoft-EMS-Community/skippy/actions/workflows/tests.yml)
+<h1 align="center">Skippy</h1>
 
-A Discord bot that tracks members with open follow-ups, sends reminders, and gives helpers tools to manage and audit follow-up resolution.
+<p align="center">
+  The Microsoft EMS Community's Discord bot: it makes sure questions get followed up,<br>
+  cleans tracking junk from links, and runs the community content feed.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Microsoft-EMS-Community/skippy/actions/workflows/tests.yml"><img src="https://github.com/Microsoft-EMS-Community/skippy/actions/workflows/tests.yml/badge.svg" alt="tests"></a>
+</p>
 
 ---
 
