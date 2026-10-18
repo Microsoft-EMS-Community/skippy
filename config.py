@@ -57,6 +57,8 @@ FEED_CHANNELS = {
 }
 FEED_POLL_MINUTES = 5                         # How often every feed is checked
 FEED_ALERT_CHANNEL_ID = RSS_AUDIT_CHANNEL_ID  # Where failing feeds are reported
+FEED_SUGGESTIONS_CHANNEL_ID = RSS_AUDIT_CHANNEL_ID  # Where mods get /feed suggest cards to approve or reject
+FEED_THREAD_CHANNEL_IDS = {FEED_CHANNELS["community-feed"]}  # Posts here get a discussion thread
 
 # New Account heuristic tagging
 NEW_ACCOUNT_ROLE_ID = 1534323968591532083   # 🆕 auto-assigned on join if heuristics trip

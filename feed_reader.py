@@ -161,12 +161,15 @@ def select_new(items: list[FeedItem], seen: set[str], limit: int) -> list[FeedIt
     return new[-limit:] if limit else []
 
 
-def format_post(feed_title: str, item: FeedItem, role_id: str | None = None) -> str:
+def format_post(feed_title: str, item: FeedItem, role_id: str | None = None,
+                author_id: str | None = None) -> str:
     """"Feed name - Post title" with the link below, which Discord turns into
     a preview card. The same plain format MEE6 used, so the channel looks
-    unchanged after the switch."""
+    unchanged after the switch, plus a credit for the author's Discord account."""
     title = discord.utils.escape_markdown(_one_line(item.title)[:MAX_TITLE_CHARS] or "New post")
     head = f"{discord.utils.escape_markdown(_one_line(feed_title))} - {title}" if feed_title else title
+    if author_id:
+        head += f" · by <@{author_id}>"
     text = f"{head}\n{clean_url(item.link)}"
     if role_id:
         text = f"<@&{role_id}> {text}"
@@ -191,13 +194,14 @@ def wanted(item: FeedItem, include: list[str], exclude: list[str]) -> bool:
 
 
 def format_summary(feed_title: str, items: list[FeedItem], highlight: list[str],
-                   role_id: str | None = None, max_messages: int = 3) -> list[str]:
+                   role_id: str | None = None, max_messages: int = 3,
+                   author_id: str | None = None) -> list[str]:
     """One summary instead of a burst of posts: a line per item, highlighted
     ones first and bold, links shown without preview cards. Split over at
     most `max_messages` messages; anything beyond that is counted."""
     ordered = sorted(items, key=lambda i: not mentions_any(i, highlight))  # stable: keeps date order
     name = discord.utils.escape_markdown(_one_line(feed_title)) if feed_title else "Feed"
-    header = f"{name} - {len(items)} new posts:"
+    header = f"{name} - {len(items)} new posts" + (f" · by <@{author_id}>:" if author_id else ":")
     if role_id:
         header = f"<@&{role_id}> {header}"
 
