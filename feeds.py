@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+from collections import Counter
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ import feed_reader
 from commands import is_rss_admin
 from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_POLL_MINUTES, FEED_ROUNDUP_CHANNEL_ID,
                     FEED_ROUNDUP_TIMEZONE, FEED_SUGGESTIONS_CHANNEL_ID, FEED_THREAD_CHANNEL_IDS,
-                    RSS_ADMIN_ROLE_ID)
+                    FEED_VOTE_EMOJI, RSS_ADMIN_ROLE_ID)
 from feed_reader import FeedError, RateLimited
 
 logger = logging.getLogger("followup-bot")
@@ -50,30 +51,34 @@ ROUNDUP_ACTIONS = [
 ]
 
 
-def build_roundup(posts: list[dict], now: datetime) -> discord.Embed | None:
-    """The weekly roundup: last week's posts grouped per blogger (most posts
-    first), plus a shout-out to the most active. None for a quiet week.
-    Mentions in embeds never ping, so crediting people here is silent."""
+def build_roundup(posts: list[dict], now: datetime, votes: dict[str, int] | None = None) -> discord.Embed | None:
+    """The weekly roundup: last week's posts grouped per blogger (in the order
+    they first posted), plus the week's three most-voted posts by
+    FEED_VOTE_EMOJI reactions. None for a quiet week. Mentions in embeds never
+    ping, so crediting people here is silent."""
     if not posts:
         return None
+    votes = votes or {}
     groups: dict[str, dict] = {}
-    for p in posts:
+    for p in posts:  # oldest first, so groups come out in order of each blogger's first post
         key = p["author_id"] or f"feed-{p['feed_id']}"
-        group = groups.setdefault(key, {"author_id": p["author_id"], "feed_title": p["feed_title"] or "", "posts": []})
-        group["posts"].append(p)
-    ranked = sorted(groups.values(), key=lambda g: (-len(g["posts"]), g["feed_title"].lower()))
+        groups.setdefault(key, {"author_id": p["author_id"], "feed_title": p["feed_title"] or "", "posts": []})
+        groups[key]["posts"].append(p)
 
-    def who(group):
-        return f"<@{group['author_id']}>" if group["author_id"] else f"**{discord.utils.escape_markdown(group['feed_title'])}**"
+    def who(author_id, feed_title):
+        return f"<@{author_id}>" if author_id else f"**{discord.utils.escape_markdown(feed_title or '')}**"
 
-    header = (f"**{len(posts)} new post{'s' if len(posts) != 1 else ''} from {len(ranked)} "
-              f"blogger{'s' if len(ranked) != 1 else ''}** this week. Thanks for writing! 💙\n")
+    def linked(p):
+        title = discord.utils.escape_markdown(" ".join(p["title"].split())[:150]).replace("[", "(").replace("]", ")")
+        return f"[{title}](<{p['link']}>)"
+
+    header = (f"**{len(posts)} new post{'s' if len(posts) != 1 else ''} from {len(groups)} "
+              f"blogger{'s' if len(groups) != 1 else ''}** this week. Thanks for writing! 💙\n")
     body, shown = "", 0
-    for group in ranked:
-        block = f"\n{who(group)}"
+    for group in groups.values():
+        block = f"\n{who(group['author_id'], group['feed_title'])}"
         for p in group["posts"]:
-            title = discord.utils.escape_markdown(" ".join(p["title"].split())[:150]).replace("[", "(").replace("]", ")")
-            block += f"\n• [{title}](<{p['link']}>)"
+            block += f"\n• {linked(p)}"
         if len(header) + len(body) + len(block) > 3900:  # embed descriptions stop at 4096
             body += f"\n\n…and {len(posts) - shown} more posts."
             break
@@ -83,13 +88,16 @@ def build_roundup(posts: list[dict], now: datetime) -> discord.Embed | None:
     week = (now - timedelta(days=1)).isocalendar().week  # the week that just ended
     embed = discord.Embed(title=f"📰 Community roundup · week {week}", description=header + body,
                           color=discord.Color.blurple())
-    if len(ranked) > 1:
-        podium = ["🥇", "🥈", "🥉"]
-        embed.add_field(name="🏆 Most active this week", value="\n".join(
-            f"{podium[n]} {who(g)} · {len(g['posts'])} post{'s' if len(g['posts']) != 1 else ''}"
-            for n, g in enumerate(ranked[:3])), inline=False)
-    embed.set_footer(text="Want your blog in here? Suggest it with /blog suggest")
+    voted = sorted((p for p in posts if votes.get(p["message_url"] or "", 0) > 0),
+                   key=lambda p: -votes[p["message_url"]])  # stable: ties go to the earlier post
+    if voted:
+        lines = [f"{medal} {linked(p)} by {who(p['author_id'], p['feed_title'])} · {votes[p['message_url']]} {FEED_VOTE_EMOJI}"
+                 for medal, p in zip(["🥇", "🥈", "🥉"], voted)]
+        # Server emojis render in field values, not in field names or footers.
+        embed.add_field(name="🏆 Community favourites this week", value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text="Vote for favourites by reacting to posts · Want your blog in here? /blog suggest")
     return embed
+
 
 # A fixed list, not any channel: feeds only ever post where they're meant to.
 # Values are strings because channel IDs are too big for Discord's integers.
@@ -637,7 +645,8 @@ class FeedCommands(commands.Cog):
         if await db.get_setting("feed_roundup_last_week") == week:
             return False
         await db.set_setting("feed_roundup_last_week", week)  # first, so a crash can't post it twice
-        embed = build_roundup(await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID)), now)
+        posts = await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID))
+        embed = build_roundup(posts, now, await self._vote_counts(posts))
         channel = self.bot.get_channel(FEED_ROUNDUP_CHANNEL_ID)
         if embed is None or channel is None:
             logger.info("Weekly roundup: %s", "quiet week, nothing to post" if embed is None else "channel not found")
@@ -645,6 +654,27 @@ class FeedCommands(commands.Cog):
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         logger.info("Weekly roundup posted for %s", week)
         return True
+
+    async def _vote_counts(self, posts: list[dict]) -> dict[str, int]:
+        """FEED_VOTE_EMOJI votes per posted message, not counting Skippy's own
+        reaction or the author's. Summary messages (several posts in one
+        message) are left out: a vote there can't tell the posts apart."""
+        per_message = Counter(p["message_url"] for p in posts if p["message_url"])
+        authors = {p["message_url"]: p["author_id"] for p in posts}
+        votes = {}
+        for url, n in per_message.items():
+            if n > 1:
+                continue
+            try:
+                channel_id, message_id = (int(part) for part in url.rstrip("/").split("/")[-2:])
+                message = await self.bot.get_channel(channel_id).fetch_message(message_id)
+            except (ValueError, AttributeError, discord.HTTPException):
+                continue  # deleted message or channel: no votes to count
+            for reaction in message.reactions:
+                if str(reaction.emoji) == FEED_VOTE_EMOJI:
+                    votes[url] = len([u async for u in reaction.users()
+                                      if u.id != self.bot.user.id and str(u.id) != authors[url]])
+        return votes
 
     @feed.command(name="roundup", description="The weekly community roundup: preview it, post it now, or switch it.")
     @app_commands.describe(action="What to do (default: a preview only you see)")
@@ -659,22 +689,23 @@ class FeedCommands(commands.Cog):
                 f"Weekly roundup is now **{action}**" + (f": {when}." if action == "on" else "."), ephemeral=True)
             return
         now = datetime.now(ROUNDUP_TZ)
-        embed = build_roundup(await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID)), now)
+        await interaction.response.defer(ephemeral=True)  # counting votes can take longer than Discord's 3 s
+        posts = await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID))
+        embed = build_roundup(posts, now, await self._vote_counts(posts))
+        reply = interaction.followup.send
         if embed is None:
-            await interaction.response.send_message(
-                "No posts from the community feeds in the last 7 days, so there's nothing to round up.",
-                ephemeral=True)
+            await reply("No posts from the community feeds in the last 7 days, so there's nothing to round up.",
+                        ephemeral=True)
             return
         if action == "preview":
             status = "on" if await db.get_setting("feed_roundup", "on") == "on" else "off"
-            await interaction.response.send_message(
-                f"Preview (weekly roundup is **{status}**: {when}):", embed=embed, ephemeral=True)
+            await reply(f"Preview (weekly roundup is **{status}**: {when}):", embed=embed, ephemeral=True)
             return
         channel = self.bot.get_channel(FEED_ROUNDUP_CHANNEL_ID)
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         # Counts as this week's roundup, so Monday's doesn't repeat it.
         await db.set_setting("feed_roundup_last_week", "{0}-W{1}".format(*now.isocalendar()[:2]))
-        await interaction.response.send_message(f"Posted the roundup in {channel.mention}.", ephemeral=True)
+        await reply(f"Posted the roundup in {channel.mention}.", ephemeral=True)
         logger.info("Roundup posted on demand by %s", interaction.user)
 
     # ──────────────────────────────────────────
@@ -819,6 +850,8 @@ class FeedCommands(commands.Cog):
                                                  allowed_mentions=mentions)
                     posted.add(item.key)
                     archive.append((item, message.jump_url))
+                    if channel.id == FEED_ROUNDUP_CHANNEL_ID:
+                        await self._add_vote(message)
                     if channel.id in FEED_THREAD_CHANNEL_IDS:
                         await self._open_thread(message, item.title)
         except discord.HTTPException as e:
@@ -827,6 +860,15 @@ class FeedCommands(commands.Cog):
             await db.archive_feed_posts([(feed["id"], name, i.title, feed_reader.clean_url(i.link), url)
                                          for i, url in archive])
         return posted
+
+    @staticmethod
+    async def _add_vote(message: discord.Message):
+        """Skippy's own vote emoji on the post, so voting is a single click.
+        Like threads, failing here must not count the post as unposted."""
+        try:
+            await message.add_reaction(FEED_VOTE_EMOJI)
+        except discord.HTTPException as e:
+            logger.warning("Couldn't add the vote emoji to %s: %s", message.jump_url, e)
 
     @staticmethod
     async def _open_thread(message: discord.Message, title: str):

@@ -247,7 +247,10 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   `/feed edit activity_exempt:True`, are never affected.
 - **Weekly roundup:** Mondays 09:00 Danish time (`FEED_ROUNDUP_TIMEZONE`),
   #community-feed (`FEED_ROUNDUP_CHANNEL_ID`) gets a recap of the week's
-  posts from its feeds, grouped per blogger, with a 🏆 top-3 shout-out.
+  posts from its feeds, grouped per blogger, with the week's 🏆 community
+  favourites: the 3 posts with the most :msems: votes (`FEED_VOTE_EMOJI`).
+  Skippy adds the emoji to each post so voting is one click; its own and the
+  author's votes don't count, nor do posts that went out in a summary.
   Nobody is pinged. A week without posts gets no roundup. Mods preview it,
   post it early or switch it off with `/feed roundup`.
 - `/feed` is only shown to members with Manage Roles (the Moderator role);
