@@ -13,8 +13,12 @@ skippy/
 ├── config.py        # All configuration (tokens, IDs, DB path)
 ├── commands.py      # Slash commands (/unmark /score /audit)
 ├── tasks.py         # Background 24h loop (48h warning, 7d ignored)
-├── requirements.txt # Python dependencies
-├── followup-bot.service  # systemd unit file
+├── requirements.txt # Python dependencies (pinned)
+├── tests/           # Unit tests (no network or Discord needed)
+├── deploy/          # Reference copies of the server's service, sandbox and auto-deploy setup
+├── .github/         # GitHub Actions: runs the tests on every PR
+├── CONTRIBUTING.md  # How changes get reviewed and deployed
+├── LICENSE          # MIT
 └── README.md        # This file
 ```
 
@@ -102,34 +106,20 @@ venv/bin/python bot.py
 
 ---
 
-## 🛠 Install as systemd Service
+## 🛠 Deployment
+
+The production server runs Skippy as its own unprivileged `skippy` user in a
+sandboxed systemd service, and deploys `master` automatically: every 5
+minutes it pulls from GitHub, runs the tests, restarts the bot and posts the
+result to the helper log channel, rolling back if the bot doesn't stay up.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the flow, and `deploy/` for
+reference copies of the server setup.
 
 ```bash
-# Copy unit file to systemd
-sudo cp followup-bot.service /etc/systemd/system/
-
-# Reload systemd and enable the service
-sudo systemctl daemon-reload
-sudo systemctl enable followup-bot
-sudo systemctl start followup-bot
-```
-
-### Check service status
-
-```bash
-sudo systemctl status followup-bot
-```
-
-### View live logs
-
-```bash
-sudo journalctl -u followup-bot -f
-```
-
-### Restart after config changes
-
-```bash
-sudo systemctl restart followup-bot
+sudo systemctl status skippy            # service status
+sudo journalctl -u skippy -f            # live logs
+sudo journalctl -u skippy-deploy -n 50  # recent auto-deploy runs
+sudo skippy-deploy --manual             # deploy a requirements.txt change after review
 ```
 
 ---
@@ -185,7 +175,7 @@ When a member with 🔴 role posts in any non-bot channel:
 
 ## 🗃 Database Schema
 
-Located at the path set in `config.py` (`followup.db` by default).
+Located at `SKIPPY_DB_PATH` if set (on the server: `/var/lib/skippy/followup.db`), otherwise `followup.db` next to `config.py`.
 
 - **follow_ups** — one row per flagged event (status: `open` / `resolved` / `ignored`)
 - **user_scores** — running totals per user
@@ -206,3 +196,9 @@ Located at the path set in `config.py` (`followup.db` by default).
 | `Privileged: Server Members` | Detect role changes via `on_member_update` |
 | `Privileged: Message Content` | Read message text for `question_snippet` |
 | `Privileged: (Reactions intent auto-enabled)` | Detect helper emoji reactions for flagging |
+
+---
+
+## 📄 License
+
+MIT, see [LICENSE](LICENSE). Contributions welcome, see [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -1,0 +1,11 @@
+# Reference copy; installed as /etc/systemd/system/skippy-deploy.timer.
+[Unit]
+Description=Check GitHub for Skippy updates every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

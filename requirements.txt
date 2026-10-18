@@ -1,2 +1,14 @@
-discord.py>=2.3.0
-aiosqlite>=0.19.0
+# Exact versions, matching the server. Changing this file means new code from
+# PyPI, so a PR that touches it is never auto-deployed (see CONTRIBUTING.md).
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.3
+aiosignal==1.4.0
+aiosqlite==0.22.1
+attrs==25.4.0
+discord.py==2.6.4
+frozenlist==1.8.0
+idna==3.11
+multidict==6.7.1
+propcache==0.4.1
+typing_extensions==4.15.0
+yarl==1.22.0

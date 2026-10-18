@@ -1,0 +1,9 @@
+# Reference copy; installed as /etc/systemd/system/skippy-deploy.service.
+[Unit]
+Description=Skippy auto-deploy from GitHub master
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/skippy-deploy

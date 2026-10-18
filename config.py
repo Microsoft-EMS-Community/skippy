@@ -34,9 +34,13 @@ HELPER_ROLE_IDS = [
 # Default: 🔴 (standard Unicode). If using a custom server emoji, use its name as a string.
 FLAG_EMOJI = "🔴"
 
-# Path to the SQLite database file. Next to this file, so moving the bot's
-# folder can't silently point it at a fresh empty database.
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "followup.db")
+# Path to the SQLite database file. The server sets SKIPPY_DB_PATH (see
+# deploy/skippy.service) to keep data out of the code checkout; locally it
+# defaults to next to this file, so moving the folder can't silently point
+# the bot at a fresh empty database.
+DB_PATH = os.environ.get("SKIPPY_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "followup.db"
+)
 
 # RSS Watchlist feature
 RSS_ADMIN_ROLE_ID = 1008083497291874304   # Role that can use /rsswatch commands

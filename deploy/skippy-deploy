@@ -1,0 +1,124 @@
+#!/bin/bash
+# Reference copy. Installed root-owned as /usr/local/sbin/skippy-deploy and
+# run every 5 minutes by skippy-deploy.timer. It lives outside the checkout,
+# so a merged PR can't change what it does.
+#
+# Pull-based deploy of GitHub master: if it moved, test the new commit in a
+# sandbox (no network, no /home), fast-forward the live checkout, restart
+# Skippy and post the result to Discord. If Skippy doesn't stay up, roll back.
+# Git, pip and the tests run as the unprivileged skippy user; root only
+# restarts the service and posts the notice.
+#
+# Usage: skippy-deploy            normal run (timer)
+#        skippy-deploy --manual   also deploy requirements.txt changes, and
+#                                 retry a commit that was rejected before
+set -euo pipefail
+
+APP=/srv/discord/bots/skippy
+SERVICE=skippy
+STATE=/var/lib/skippy-deploy
+MANUAL=false
+[ "${1:-}" = "--manual" ] && MANUAL=true
+NOTIFY_CHANNEL_ID=
+# deploy.env sets NOTIFY_CHANNEL_ID, the Discord channel for notices.
+[ -r /etc/skippy/deploy.env ] && . /etc/skippy/deploy.env
+nl=$'\n'
+
+exec 9>/run/skippy-deploy.lock
+flock -n 9 || exit 0
+
+as_skippy() {
+    runuser -u skippy -- env -i HOME=/var/lib/skippy PATH=/usr/bin:/bin LANG=C.UTF-8 \
+        GIT_SSH_COMMAND="ssh -i /etc/skippy/pull_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/skippy/known_hosts" \
+        "$@"
+}
+git_() { as_skippy git -C "$APP" "$@"; }
+install_requirements() { # $1: requirements file readable by skippy
+    # Wheels only: installing never runs a package's own setup code.
+    as_skippy "$APP/venv/bin/pip" install --quiet --disable-pip-version-check \
+        --only-binary=:all: -r "$1"
+}
+
+notify() {
+    echo "$1"
+    [ -n "$NOTIFY_CHANNEL_ID" ] || return 0
+    local token
+    token=$(sed -n 's/^DISCORD_BOT_TOKEN=//p' /etc/skippy/secrets.env | tr -d "\"'\r")
+    # Commit messages come from contributors: allowed_mentions stops @everyone pings.
+    python3 -c 'import json, sys; print(json.dumps({"content": sys.argv[1][:1990], "allowed_mentions": {"parse": []}}))' "$1" |
+        curl -sf -o /dev/null --max-time 10 -X POST --data-binary @- \
+            -H @<(printf 'Authorization: Bot %s\nContent-Type: application/json\n' "$token") \
+            "https://discord.com/api/v10/channels/$NOTIFY_CHANNEL_ID/messages" ||
+        echo "skippy-deploy: posting the Discord notice failed" >&2
+}
+
+if ! git_ fetch --quiet origin master 2>"$STATE/fetch.err"; then
+    # Network blips are normal; only speak up once it's been failing a day.
+    last=$(stat -c %Y "$STATE/last_fetch_ok" 2>/dev/null || echo 0)
+    if [ $(($(date +%s) - last)) -gt 86400 ] && [ ! -e "$STATE/fetch_alerted" ]; then
+        notify "⚠️ Skippy auto-deploy can't fetch from GitHub: $(head -c 300 "$STATE/fetch.err")"
+        touch "$STATE/fetch_alerted"
+    fi
+    exit 0
+fi
+rm -f "$STATE/fetch_alerted"
+touch "$STATE/last_fetch_ok"
+
+old=$(git_ rev-parse HEAD)
+new=$(git_ rev-parse origin/master)
+[ "$old" != "$new" ] || exit 0
+# A rejected commit isn't retried (or re-announced) every 5 minutes.
+if ! $MANUAL && [ "$(cat "$STATE/rejected" 2>/dev/null)" = "$new" ]; then
+    exit 0
+fi
+short=${new:0:7}
+
+reject() {
+    echo "$new" >"$STATE/rejected"
+    notify "⚠️ Skippy: \`$short\` was not deployed. $1"
+    exit 0
+}
+
+git_ merge-base --is-ancestor "$old" "$new" ||
+    reject "master's history was rewritten, so it needs deploying by hand."
+reqs_changed=false
+git_ diff --quiet "$old" "$new" -- requirements.txt || reqs_changed=true
+if $reqs_changed && ! $MANUAL; then
+    reject "It changes requirements.txt (new code from PyPI). After reviewing that, run: sudo skippy-deploy --manual"
+fi
+
+# Test an exported copy of the new commit before touching the live checkout.
+work=$(mktemp -d "$STATE/test.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+chown skippy: "$work"
+git_ archive "$new" | as_skippy tar -x -C "$work"
+if $reqs_changed && ! install_requirements "$work/requirements.txt"; then
+    install_requirements "$APP/requirements.txt" || true
+    reject "Installing its requirements failed."
+fi
+if ! out=$(systemd-run --quiet --wait --pipe --collect \
+    -p User=skippy -p WorkingDirectory="$work" -p PrivateNetwork=yes \
+    -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes \
+    -p NoNewPrivileges=yes -p RuntimeMaxSec=300 -E PYTHONDONTWRITEBYTECODE=1 \
+    "$APP/venv/bin/python" -m unittest discover -s tests 2>&1); then
+    if $reqs_changed; then install_requirements "$APP/requirements.txt" || true; fi
+    reject "Its tests failed:${nl}\`\`\`${nl}$(tail -c 1200 <<<"$out")${nl}\`\`\`"
+fi
+
+changes=$(git_ log --no-merges --format='• %s (%an)' "$old..$new" | head -n 10)
+git_ merge --ff-only --quiet "$new"
+systemctl restart "$SERVICE"
+restarts=$(systemctl show -p NRestarts --value "$SERVICE")
+# Healthy = still running 30s later without having crashed and restarted.
+sleep 30
+if [ "$(systemctl is-active "$SERVICE")" = active ] &&
+    [ "$(systemctl show -p NRestarts --value "$SERVICE")" = "$restarts" ]; then
+    notify "✅ Skippy deployed \`$short\`:${nl}${changes}"
+    exit 0
+fi
+
+git_ reset --hard --quiet "$old"
+if $reqs_changed; then install_requirements "$APP/requirements.txt" || true; fi
+systemctl restart "$SERVICE"
+echo "$new" >"$STATE/rejected"
+notify "❌ Skippy: \`$short\` crashed after starting, so it was rolled back to \`${old:0:7}\`. Logs: journalctl -u skippy"

@@ -1,0 +1,52 @@
+# Reference copy. The installed unit is /etc/systemd/system/skippy.service,
+# managed by the server admin; editing this file changes nothing on the server.
+#
+# Skippy runs community-contributed code, so it runs as its own unprivileged
+# user and is sandboxed to its state directory: no access to /home, a
+# read-only system, and no route to cloud metadata or internal networks.
+
+[Unit]
+Description=Skippy Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skippy
+Group=skippy
+WorkingDirectory=/srv/discord/bots/skippy
+EnvironmentFile=/etc/skippy/secrets.env
+Environment=SKIPPY_DB_PATH=/var/lib/skippy/followup.db
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/discord/bots/skippy/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/skippy
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Defence in depth for link_cleaner's SSRF checks: Azure metadata/WireServer,
+# link-local and private ranges. Loopback stays open for the DNS stub resolver.
+IPAddressDeny=169.254.0.0/16 168.63.129.16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
