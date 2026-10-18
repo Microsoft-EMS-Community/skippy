@@ -28,9 +28,7 @@ exec 9>/run/skippy-deploy.lock
 flock -n 9 || exit 0
 
 as_skippy() {
-    runuser -u skippy -- env -i HOME=/var/lib/skippy PATH=/usr/bin:/bin LANG=C.UTF-8 \
-        GIT_SSH_COMMAND="ssh -i /etc/skippy/pull_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/skippy/known_hosts" \
-        "$@"
+    runuser -u skippy -- env -i HOME=/var/lib/skippy PATH=/usr/bin:/bin LANG=C.UTF-8 "$@"
 }
 git_() { as_skippy git -C "$APP" "$@"; }
 install_requirements() { # $1: requirements file readable by skippy
@@ -39,18 +37,72 @@ install_requirements() { # $1: requirements file readable by skippy
         --only-binary=:all: -r "$1"
 }
 
-notify() {
+notify() { # $1: message, $2: JSON list of Discord user IDs it may ping (default: none)
     echo "$1"
     [ -n "$NOTIFY_CHANNEL_ID" ] || return 0
     local token
     token=$(sed -n 's/^DISCORD_BOT_TOKEN=//p' /etc/skippy/secrets.env | tr -d "\"'\r")
-    # Commit messages come from contributors: allowed_mentions stops @everyone pings.
-    python3 -c 'import json, sys; print(json.dumps({"content": sys.argv[1][:1990], "allowed_mentions": {"parse": []}}))' "$1" |
+    # Messages quote contributors' commit messages and PR titles, so
+    # allowed_mentions only lets through the opted-in authors passed in $2:
+    # never @everyone, @here or roles.
+    python3 -c 'import json, sys; print(json.dumps({"content": sys.argv[1][:1990], "allowed_mentions": {"parse": [], "users": json.loads(sys.argv[2])}}))' "$1" "${2:-[]}" |
         curl -sf -o /dev/null --max-time 10 -X POST --data-binary @- \
             -H @<(printf 'Authorization: Bot %s\nContent-Type: application/json\n' "$token") \
             "https://discord.com/api/v10/channels/$NOTIFY_CHANNEL_ID/messages" ||
         echo "skippy-deploy: posting the Discord notice failed" >&2
 }
+
+# Builds the success notice's change list: one line per merged PR, pinging
+# its author if they opted in via contributors.json. Args: "sha<TAB>author
+# <TAB>subject" lines, and the contributors.json text. Prints the IDs it may
+# ping (a JSON list) on the first line, then the change lines.
+read -r -d '' CHANGES_PY <<'PY' || true
+import json, re, sys, urllib.request
+
+REPO = "Microsoft-EMS-Community/skippy"
+summary, raw = sys.argv[1], sys.argv[2]
+try:
+    listed = json.loads(raw)
+except ValueError:
+    listed = {}
+# Opt-in GitHub login -> Discord user ID. Anything malformed is ignored.
+discord_ids = {
+    login.lower(): uid
+    for login, uid in (listed.items() if isinstance(listed, dict) else [])
+    if not login.startswith("_") and isinstance(uid, str) and re.fullmatch(r"\d{17,20}", uid)
+}
+
+
+def merged_pull_request(sha):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{REPO}/commits/{sha}/pulls",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "skippy-deploy"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pulls = json.load(resp)
+    except Exception:
+        return None
+    merged = [p for p in pulls if p.get("merged_at")]
+    return merged[0] if merged else None
+
+
+lines, mention = [], []
+for row in summary.splitlines():
+    sha, author, subject = row.split("\t", 2)
+    pr = merged_pull_request(sha)
+    if not pr:
+        lines.append(f"• {subject} ({author})")
+        continue
+    login = pr["user"]["login"]
+    uid = discord_ids.get(login.lower())
+    if uid and uid not in mention:
+        mention.append(uid)
+    thanks = f", thanks <@{uid}>!" if uid else ""
+    lines.append(f"• {pr['title']} (#{pr['number']}) by {login}{thanks}")
+print(json.dumps(mention))
+print("\n".join(lines))
+PY
 
 if ! git_ fetch --quiet origin master 2>"$STATE/fetch.err"; then
     # Network blips are normal; only speak up once it's been failing a day.
@@ -105,7 +157,17 @@ if ! out=$(systemd-run --quiet --wait --pipe --collect \
     reject "Its tests failed:${nl}\`\`\`${nl}$(tail -c 1200 <<<"$out")${nl}\`\`\`"
 fi
 
-changes=$(git_ log --no-merges --format='• %s (%an)' "$old..$new" | head -n 10)
+# Worked out before the restart so GitHub API lookups don't eat into the
+# health-check window. If the lookup fails, fall back to plain subjects.
+summary=$(git_ log --first-parent --format='%H%x09%an%x09%s' "$old..$new" | head -n 10)
+contributors=$(git_ show "$new:contributors.json" 2>/dev/null || echo '{}')
+if out=$(python3 -c "$CHANGES_PY" "$summary" "$contributors" 2>/dev/null); then
+    mention_ids=${out%%$'\n'*}
+    changes=${out#*$'\n'}
+else
+    mention_ids='[]'
+    changes=$(git_ log --first-parent --format='• %s (%an)' "$old..$new" | head -n 10)
+fi
 git_ merge --ff-only --quiet "$new"
 systemctl restart "$SERVICE"
 restarts=$(systemctl show -p NRestarts --value "$SERVICE")
@@ -113,7 +175,7 @@ restarts=$(systemctl show -p NRestarts --value "$SERVICE")
 sleep 30
 if [ "$(systemctl is-active "$SERVICE")" = active ] &&
     [ "$(systemctl show -p NRestarts --value "$SERVICE")" = "$restarts" ]; then
-    notify "✅ Skippy deployed \`$short\`:${nl}${changes}"
+    notify "✅ Skippy deployed \`$short\`:${nl}${changes}" "$mention_ids"
     exit 0
 fi
 

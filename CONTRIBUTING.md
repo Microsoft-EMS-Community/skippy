@@ -12,11 +12,27 @@ the bot updates itself.
 3. A maintainer reviews and merges it.
 4. Within about 5 minutes the server picks up `master`, runs the tests again
    in a sandbox, and restarts Skippy. The result is posted in the helper log
-   channel. If Skippy doesn't stay up, it's rolled back automatically.
+   channel, with a ping for you if you've opted in (below). If Skippy doesn't
+   stay up, it's rolled back automatically.
 
 Changes to `requirements.txt` are never deployed automatically, because they
 pull new code from PyPI. A maintainer deploys those by hand after reviewing
 them. Keep every version pinned with `==`.
+
+## Get a Discord ping when your change goes live
+
+Add yourself to `contributors.json` in your PR, and the deploy notice will
+ping you when your change is live:
+
+1. In Discord, open **User Settings → Advanced** and turn on **Developer Mode**.
+2. Right-click your own name and choose **Copy User ID**.
+3. Add a line with your GitHub username and that ID, both in quotes:
+   `"YourGitHubName": "123456789012345678"`
+
+The username has to be the GitHub account opening the PR; maintainers check
+that, so nobody can sign someone else up. Your Discord ID becomes public in
+this repo. It isn't secret (anyone in the server can copy it), but only add
+it if you're fine with that. To stop the pings, remove your line in a PR.
 
 ## Running the tests
 
