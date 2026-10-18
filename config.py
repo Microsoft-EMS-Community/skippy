@@ -41,6 +41,12 @@ DB_PATH = os.environ.get("SKIPPY_DB_PATH") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "followup.db"
 )
 
+# Log files, next to the database (on the server: /var/lib/skippy/logs). A new
+# file starts every midnight and files older than LOG_DAYS are deleted, so the
+# logs never grow past about a week.
+LOG_DIR = os.path.join(os.path.dirname(DB_PATH), "logs")
+LOG_DAYS = 7
+
 # RSS Watchlist feature
 RSS_ADMIN_ROLE_ID = 1008083497291874304   # Role that can use /rsswatch commands
 RSS_AUDIT_CHANNEL_ID = 1438251870106947806  # Channel where RSS reports are posted

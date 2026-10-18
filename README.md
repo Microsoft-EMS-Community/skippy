@@ -131,6 +131,7 @@ sudo systemctl status skippy            # service status
 sudo journalctl -u skippy -f            # live logs
 sudo journalctl -u skippy-deploy -n 50  # recent auto-deploy runs
 sudo skippy-deploy --manual             # deploy a requirements.txt change after review
+sudo less /var/lib/skippy/logs/skippy.log  # Skippy's own log: today, plus one file per day for 7 days
 ```
 
 ---
@@ -239,7 +240,12 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   `/feed edit`) shows "· by @member" on every post and pings them, and puts
   them on the RSS watchlist so their server activity is tracked.
 - **Discussion threads:** posts in #community-feed (`FEED_THREAD_CHANNEL_IDS`)
-  get a thread on the post itself, named after the article.
+  get a thread on the post itself, named after the article. Every post gets
+  the same treatment however it was posted (a check, `/feed add`, an approved
+  suggestion or `/feed test`); summaries get a thread but no vote emoji.
+- **Audit trail:** every mod action on feeds (add, edit, remove, test, the
+  activity rule, the roundup) is posted as a line in the RSS audit channel and
+  stored in the audit log (`/audit`).
 - **Activity rule:** the content tracker is for active members. A feed
   linked to an author follows the rule mods set with `/feed activity`,
   phased in step by step:

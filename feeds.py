@@ -56,9 +56,17 @@ def build_roundup(posts: list[dict], now: datetime, votes: dict[str, int] | None
     they first posted), plus the week's three most-voted posts by
     FEED_VOTE_EMOJI reactions. None for a quiet week. Mentions in embeds never
     ping, so crediting people here is silent."""
+    votes = votes or {}
+    # The same article can be posted twice (say, by /feed test): keep the copy
+    # with the most votes, in its first position.
+    best: dict[str, dict] = {}
+    for p in posts:
+        kept = best.get(p["link"])
+        if kept is None or votes.get(p["message_url"] or "", 0) > votes.get(kept["message_url"] or "", 0):
+            best[p["link"]] = p
+    posts = [p for p in posts if best[p["link"]] is p]
     if not posts:
         return None
-    votes = votes or {}
     groups: dict[str, dict] = {}
     for p in posts:  # oldest first, so groups come out in order of each blogger's first post
         key = p["author_id"] or f"feed-{p['feed_id']}"
@@ -284,7 +292,8 @@ class FeedCommands(commands.Cog):
             f"Preview the format with `/feed test feed:{feed_id}`, and set filters with `/feed edit`."
             + "".join(notes),
             ephemeral=True)
-        logger.info("Feed #%s added by %s: %s -> #%s", feed_id, interaction.user, url, target)
+        await self._audit(interaction, "add", f"added feed #{feed_id} **{self._name(row)}** → {target.mention}"
+                          + (f", by {author.mention}" if author else ""))
 
     @feed.command(name="remove", description="Stop posting a feed.")
     @app_commands.describe(feed="The feed to remove")
@@ -297,7 +306,7 @@ class FeedCommands(commands.Cog):
         await interaction.response.send_message(
             f"🗑️ Removed feed #{feed} **{discord.utils.escape_markdown(feed_name(row))}**.",
             ephemeral=True)
-        logger.info("Feed #%s removed by %s", feed, interaction.user)
+        await self._audit(interaction, "remove", f"removed feed #{feed} **{self._name(row)}**")
 
     @feed.command(name="list", description="Show all feeds and whether they're working.")
     @is_rss_admin()
@@ -380,12 +389,21 @@ class FeedCommands(commands.Cog):
         verb = "Updated" if changes else "Settings for"
         await interaction.response.send_message(f"{verb} feed #{feed}:\n{self._describe(row)}", ephemeral=True)
         if changes:
-            logger.info("Feed #%s edited by %s: %s", feed, interaction.user, changes)
+            labels = {"channel_id": "channel", "role_id": "ping role", "author_id": "author", "display_name": "name",
+                      "include_words": "include words", "exclude_words": "exclude words",
+                      "highlight_words": "highlight words", "summary_after": "summary threshold",
+                      "activity_exempt": "activity exemption"}
+            await self._audit(interaction, "edit", f"edited feed #{feed} **{self._name(row)}**: "
+                              + ", ".join(labels[k] for k in changes))
 
     @blog.command(name="search", description="Search everything the feeds have posted.")
     @app_commands.describe(words="Words to look for in post titles and feed names")
     async def feed_search(self, interaction: discord.Interaction, words: app_commands.Range[str, 2, 100]):
-        results = await db.search_feed_posts(words.split()[:5])
+        results, seen = [], set()
+        for r in await db.search_feed_posts(words.split()[:5], limit=30):
+            if r["link"] not in seen and len(results) < 10:  # an article posted twice shows once
+                seen.add(r["link"])
+                results.append(r)
         if not results:
             await interaction.response.send_message(f"Nothing posted matches **{discord.utils.escape_markdown(words)}**.",
                                                     ephemeral=True)
@@ -484,8 +502,8 @@ class FeedCommands(commands.Cog):
             return
         credit = f", credited to <@{author_id}>" if author_id else ""
         newest = feed_reader.select_new(items, set(), 1)
+        row = await db.get_feed(feed_id, str(interaction.guild_id))
         if newest:  # welcome the blog with its newest article, which also shows the feed works
-            row = await db.get_feed(feed_id, str(interaction.guild_id))
             await self._post(channel, row, feed_name(row, title), newest, ping=False)
         await self._close_card(interaction.message, discord.Color.green(),
                                f"✅ Approved by {interaction.user.mention}: feed #{feed_id} → {channel.mention}{credit}")
@@ -494,6 +512,9 @@ class FeedCommands(commands.Cog):
                        f"approved! New posts will appear in {channel.mention}"
                        + (", with a shout-out to you." if author_id else "."))
         logger.info("Feed suggestion #%s approved by %s as feed #%s", suggestion_id, interaction.user, feed_id)
+        await db.add_audit_log(action="feed_suggestion_approved", actor_id=str(interaction.user.id),
+                               target_id=suggestion["suggested_by"],
+                               detail=f"suggestion #{suggestion_id} → feed #{feed_id} {feed_name(row, title)}")
 
     async def reject_suggestion(self, interaction: discord.Interaction, suggestion_id: int, reason: str | None):
         if not await db.decide_suggestion(suggestion_id, "rejected", str(interaction.user.id), reason):
@@ -508,6 +529,9 @@ class FeedCommands(commands.Cog):
                        "The mods decided not to add it this time."
                        + (f"\nReason: {reason}" if reason else ""))
         logger.info("Feed suggestion #%s rejected by %s", suggestion_id, interaction.user)
+        await db.add_audit_log(action="feed_suggestion_rejected", actor_id=str(interaction.user.id),
+                               target_id=suggestion["suggested_by"],
+                               detail=f"suggestion #{suggestion_id} {suggestion['url']}" + (f": {reason}" if reason else ""))
 
     @staticmethod
     async def _close_card(card: discord.Message | None, color: discord.Color, decision: str):
@@ -550,10 +574,13 @@ class FeedCommands(commands.Cog):
         if not newest:
             await interaction.followup.send("The feed has no items right now.", ephemeral=True)
             return
-        # The test post shows the author credit but never pings anyone.
-        await channel.send(feed_reader.format_post(feed_name(row, title), newest[0], author_id=row["author_id"]),
-                           allowed_mentions=discord.AllowedMentions.none())
+        # Posted like any other post (archived, vote emoji, thread), just
+        # without pinging anyone.
+        if not await self._post(channel, row, feed_name(row, title), newest, ping=False):
+            await interaction.followup.send("Couldn't post it; see the bot's log.", ephemeral=True)
+            return
         await interaction.followup.send(f"Posted the newest item in {channel.mention}.", ephemeral=True)
+        await self._audit(interaction, "test", f"test-posted feed #{feed} **{self._name(row)}** in {channel.mention}")
 
     @feed_remove.autocomplete("feed")
     @feed_edit.autocomplete("feed")
@@ -702,7 +729,7 @@ class FeedCommands(commands.Cog):
         when = f"Mondays 09:00 ({FEED_ROUNDUP_TIMEZONE}) in <#{FEED_ROUNDUP_CHANNEL_ID}>"
         if action in ("on", "off"):
             await db.set_setting("feed_roundup", action)
-            logger.info("Weekly roundup switched %s by %s", action, interaction.user)
+            await self._audit(interaction, "roundup", f"switched the weekly roundup **{action}**")
             await interaction.response.send_message(
                 f"Weekly roundup is now **{action}**" + (f": {when}." if action == "on" else "."), ephemeral=True)
             return
@@ -724,7 +751,7 @@ class FeedCommands(commands.Cog):
         # Counts as this week's roundup, so Monday's doesn't repeat it.
         await db.set_setting("feed_roundup_last_week", "{0}-W{1}".format(*now.isocalendar()[:2]))
         await reply(f"Posted the roundup in {channel.mention}.", ephemeral=True)
-        logger.info("Roundup posted on demand by %s", interaction.user)
+        await self._audit(interaction, "roundup", f"posted the weekly roundup now in {channel.mention}")
 
     # ──────────────────────────────────────────
     # Activity rule: authors' feeds post while they're active in the server
@@ -810,9 +837,11 @@ class FeedCommands(commands.Cog):
             await db.set_setting("feed_activity_mode", mode)
         if min_messages:
             await db.set_setting("feed_activity_min_messages", str(min_messages))
-        if mode or min_messages:
-            logger.info("Feed activity rule set by %s: mode=%s min_messages=%s", interaction.user, mode, min_messages)
+        changed = bool(mode or min_messages)
         mode, min_messages = await self._activity_rule()
+        if changed:
+            await self._audit(interaction, "activity", f"set the activity rule to **{mode}** "
+                              f"(active = {min_messages}+ messages in {ACTIVITY_DAYS} days)")
 
         by_author: dict[str, list[dict]] = {}
         for f in await db.get_feeds(str(interaction.guild_id)):
@@ -861,6 +890,9 @@ class FeedCommands(commands.Cog):
                     if not posted:  # once the first part is out, don't repeat the summary on a retry
                         posted = {i.key for i in items}
                         archive = [(i, message.jump_url) for i in items]
+                        extras = await self._finish_post(message, f"{name} - {len(items)} new posts", summary=True)
+                        logger.info("Feed #%s: posted a summary of %d items in #%s%s",
+                                    feed["id"], len(items), channel, extras)
                     mentions = discord.AllowedMentions.none()  # ping once, not for every part
             else:
                 for item in items:
@@ -868,10 +900,8 @@ class FeedCommands(commands.Cog):
                                                  allowed_mentions=mentions)
                     posted.add(item.key)
                     archive.append((item, message.jump_url))
-                    if channel.id == FEED_ROUNDUP_CHANNEL_ID:
-                        await self._add_vote(message)
-                    if channel.id in FEED_THREAD_CHANNEL_IDS:
-                        await self._open_thread(message, item.title)
+                    extras = await self._finish_post(message, item.title)
+                    logger.info("Feed #%s: posted %r in #%s%s", feed["id"], item.title[:80], channel, extras)
         except discord.HTTPException as e:
             logger.warning("Feed #%s: posting failed, retrying next check: %s", feed["id"], e)
         if archive:
@@ -879,24 +909,46 @@ class FeedCommands(commands.Cog):
                                          for i, url in archive])
         return posted
 
-    @staticmethod
-    async def _add_vote(message: discord.Message):
-        """Skippy's own vote emoji on the post, so voting is a single click.
-        Like threads, failing here must not count the post as unposted."""
-        try:
-            await message.add_reaction(FEED_VOTE_EMOJI)
-        except discord.HTTPException as e:
-            logger.warning("Couldn't add the vote emoji to %s: %s", message.jump_url, e)
+    async def _finish_post(self, message: discord.Message, title: str, summary: bool = False) -> str:
+        """What every post gets, however it was posted: the vote emoji in the
+        roundup channel (not on summaries: a vote there can't tell posts
+        apart) and a discussion thread in thread channels. Neither failing
+        counts the post as unposted. Returns a note for the log."""
+        notes = []
+        if message.channel.id == FEED_ROUNDUP_CHANNEL_ID and not summary:
+            notes.append("vote " + ("ok" if await self._add_vote(message) else "FAILED"))
+        if message.channel.id in FEED_THREAD_CHANNEL_IDS:
+            notes.append("thread " + ("ok" if await self._open_thread(message, title) else "FAILED"))
+        return f" ({', '.join(notes)})" if notes else ""
 
     @staticmethod
-    async def _open_thread(message: discord.Message, title: str):
-        """A discussion thread on the post itself. Failing here (say, a missing
-        Create Public Threads permission) must not count the post as unposted."""
+    async def _add_vote(message: discord.Message) -> bool:
+        """Skippy's own vote emoji on the post, so voting is a single click."""
+        try:
+            await message.add_reaction(FEED_VOTE_EMOJI)
+            return True
+        except discord.HTTPException as e:
+            logger.warning("Couldn't add the vote emoji to %s: %s", message.jump_url, e)
+            return False
+
+    @staticmethod
+    async def _open_thread(message: discord.Message, title: str) -> bool:
+        """A discussion thread on the post itself."""
         try:
             await message.create_thread(name=" ".join(title.split())[:100] or "Discussion",
                                         auto_archive_duration=THREAD_ARCHIVE_MINUTES)
+            return True
         except discord.HTTPException as e:
             logger.warning("Couldn't open a thread on %s: %s", message.jump_url, e)
+            return False
+
+    async def _audit(self, interaction: discord.Interaction, action: str, text: str):
+        """Record a mod's feed action: in the audit log (/audit), the bot's
+        log, and as a line in the mods' channel so other mods see it."""
+        await db.add_audit_log(action=f"feed_{action}", actor_id=str(interaction.user.id),
+                               target_id=None, detail=text)
+        logger.info("%s %s", interaction.user, text)
+        await self._alert(f"🛠️ {interaction.user.mention} {text}")
 
     @staticmethod
     def _describe(feed: dict) -> str:

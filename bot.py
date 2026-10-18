@@ -11,7 +11,9 @@
 import discord
 from discord.ext import commands
 import logging
+import logging.handlers
 import asyncio
+import os
 
 import db
 import views as v
@@ -27,6 +29,8 @@ from config import (
     RSS_AUDIT_CHANNEL_ID,
     NEW_ACCOUNT_ROLE_ID,
     NEW_ACCOUNT_AGE_DAYS,
+    LOG_DIR,
+    LOG_DAYS,
 )
 from datetime import datetime, timezone, timedelta
 
@@ -173,10 +177,17 @@ async def score_line(user_id: str) -> str:
 # ──────────────────────────────────────────────
 # Logging setup
 # ──────────────────────────────────────────────
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),  # the service's journal
+        # skippy.log, plus one file per earlier day; older ones are deleted
+        logging.handlers.TimedRotatingFileHandler(os.path.join(LOG_DIR, "skippy.log"), when="midnight",
+                                                  backupCount=LOG_DAYS, encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("followup-bot")
 
