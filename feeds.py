@@ -296,7 +296,7 @@ class FeedCommands(commands.Cog):
     @feed.command(name="add", description="Post a feed's new items in one of the feed channels.")
     @app_commands.describe(url="The RSS or Atom feed URL",
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
-                           author="The member who writes it: credited and pinged on posts, and activity-tracked",
+                           author="The member who writes it: credited on posts, and activity-tracked",
                            name="What posts call it, if the feed's own title isn't good (e.g. just \"Blog\")",
                            **LINK_OPTIONS)
     @app_commands.choices(channel=CHANNEL_CHOICES)
@@ -341,9 +341,9 @@ class FeedCommands(commands.Cog):
         row = await db.get_feed(feed_id, str(interaction.guild_id))
         newest = feed_reader.select_new(items, set(), 1)
         if newest:
-            # The newest item as a real post (archived, credited, threaded),
-            # just without pings: a visible sign the feed is connected.
-            if await self._post(target, row, feed_name(row, title), newest, ping=False):
+            # The newest item as a real post (archived, credited, threaded):
+            # a visible sign the feed is connected.
+            if await self._post(target, row, feed_name(row, title), newest):
                 notes.append(f"\n📮 Posted its newest item in {target.mention}.")
             else:
                 notes.append("\n⚠️ Couldn't post its newest item; see the bot's log.")
@@ -397,7 +397,7 @@ class FeedCommands(commands.Cog):
     @app_commands.describe(
         feed="The feed to change",
         channel="Move it to another feed channel",
-        author="The member who writes it: credited and pinged on posts, and activity-tracked",
+        author="The member who writes it: credited on posts, and activity-tracked",
         name="What posts call it, instead of the feed's own title",
         include="Only post titles mentioning one of these words (comma-separated)",
         exclude="Never post titles mentioning any of these words (comma-separated)",
@@ -715,7 +715,7 @@ class FeedCommands(commands.Cog):
         newest = feed_reader.select_new(items, set(), 1)
         row = await db.get_feed(feed_id, str(interaction.guild_id))
         if newest:  # welcome the blog with its newest article, which also shows the feed works
-            await self._post(channel, row, feed_name(row, title), newest, ping=False)
+            await self._post(channel, row, feed_name(row, title), newest)
         await self._close_card(interaction.message, discord.Color.green(),
                                f"✅ Approved by {interaction.user.mention}: feed #{feed_id} → {channel.mention}{credit}")
         blog = discord.utils.escape_markdown(title or suggestion["url"])
@@ -791,9 +791,8 @@ class FeedCommands(commands.Cog):
         if not newest:
             await interaction.followup.send("The feed has no items right now.", ephemeral=True)
             return
-        # Posted like any other post (archived, vote emoji, thread), just
-        # without pinging anyone.
-        if not await self._post(channel, row, feed_name(row, title), newest, ping=False):
+        # Posted like any other post (archived, vote emoji, thread).
+        if not await self._post(channel, row, feed_name(row, title), newest):
             await interaction.followup.send("Couldn't post it; see the bot's log.", ephemeral=True)
             return
         await interaction.followup.send(f"Posted the newest item in {channel.mention}.", ephemeral=True)
@@ -1088,43 +1087,55 @@ class FeedCommands(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True,
                                                 allowed_mentions=discord.AllowedMentions.none())
 
-    async def _post(self, channel, feed: dict, name: str, items: list, ping: bool = True) -> set[str]:
-        """Post items one by one, or as one summary when there are more than
-        the feed's summary_after. Archives what was posted and returns its keys."""
+    async def _post(self, channel, feed: dict, name: str, items: list) -> set[str]:
+        """Post items one by one as cards, or as one summary when there are
+        more than the feed's summary_after. Archives what was posted and
+        returns its keys. Posts credit the author but ping nobody."""
         if not items:
             return set()
         author_id = feed["author_id"]
-        # Only the feed's own author can be pinged, never anyone else.
-        mentions = discord.AllowedMentions(everyone=False, roles=False,
-                                           users=[discord.Object(int(author_id))] if author_id and ping else False)
         posted, archive = set(), []
         try:
             if len(items) > feed["summary_after"]:
                 highlight = feed_reader.word_list(feed["highlight_words"])
                 for part in feed_reader.format_summary(name, items, highlight, author_id=author_id):
-                    message = await channel.send(part, allowed_mentions=mentions)
+                    message = await channel.send(part, allowed_mentions=discord.AllowedMentions.none())
                     if not posted:  # once the first part is out, don't repeat the summary on a retry
                         posted = {i.key for i in items}
                         archive = [(i, message.jump_url) for i in items]
                         extras = await self._finish_post(message, f"{name} - {len(items)} new posts", summary=True)
                         logger.info("Feed #%s: posted a summary of %d items in #%s%s",
                                     feed["id"], len(items), channel, extras)
-                    mentions = discord.AllowedMentions.none()  # ping once, not for every part
             else:
                 links_line = await self._links_line(author_id)
-                for item in items:
-                    message = await channel.send(feed_reader.format_post(name, item, author_id, links_line),
-                                                 allowed_mentions=mentions)
-                    posted.add(item.key)
-                    archive.append((item, message.jump_url))
-                    extras = await self._finish_post(message, item.title)
-                    logger.info("Feed #%s: posted %r in #%s%s", feed["id"], item.title[:80], channel, extras)
+                async with feed_reader.session() as http:
+                    for item in items:
+                        preview = await feed_reader.fetch_preview(http, item.link)
+                        message = await self._send_card(
+                            channel, feed_reader.post_card(name, item, preview, author_id, links_line))
+                        posted.add(item.key)
+                        archive.append((item, message.jump_url))
+                        extras = await self._finish_post(message, item.title)
+                        logger.info("Feed #%s: posted %r in #%s%s", feed["id"], item.title[:80], channel, extras)
         except discord.HTTPException as e:
             logger.warning("Feed #%s: posting failed, retrying next check: %s", feed["id"], e)
         if archive:
             await db.archive_feed_posts([(feed["id"], name, i.title, feed_reader.clean_url(i.link), url)
                                          for i, url in archive])
         return posted
+
+    @staticmethod
+    async def _send_card(channel, card: discord.Embed) -> discord.Message:
+        """Send a post's card. If Discord turns down the picture's address,
+        the card goes without the picture rather than not at all."""
+        try:
+            return await channel.send(embed=card, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as e:
+            if e.status != 400 or not card.image.url:
+                raise
+            logger.info("Discord refused the picture %s, posting without it: %s", card.image.url, e)
+            card.set_image(url=None)
+            return await channel.send(embed=card, allowed_mentions=discord.AllowedMentions.none())
 
     @staticmethod
     async def _links_line(author_id: str | None) -> str | None:

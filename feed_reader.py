@@ -4,10 +4,13 @@
 # ============================================================
 
 import email.utils
+import html
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from html.parser import HTMLParser
+from urllib.parse import quote, urljoin, urlsplit
 
 import aiohttp
 import discord
@@ -20,11 +23,14 @@ FETCH_TIMEOUT = aiohttp.ClientTimeout(total=20)
 MAX_FEED_BYTES = 5 * 1024 * 1024
 MAX_REDIRECT_HOPS = 5
 MAX_TITLE_CHARS = 200
+MAX_SUMMARY_CHARS = 200  # about two lines on a phone
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 RSS1 = "{http://purl.org/rss/1.0/}"
 RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
 DC = "{http://purl.org/dc/elements/1.1/}"
+CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
+MEDIA = "{http://search.yahoo.com/mrss/}"
 
 
 class FeedError(Exception):
@@ -45,6 +51,20 @@ class FeedItem:
     title: str
     link: str
     published: datetime | None  # always timezone-aware when set
+    # For the post's card (post_card). Kept as the feed has them, and only
+    # worked out for the few items that get posted.
+    summary: str = ""           # HTML, usually the post's first lines
+    content: str = ""           # HTML, often the whole post
+    image: str = ""             # a picture the feed names for the post
+    writer: str = ""            # the name the feed credits
+
+
+@dataclass
+class PagePreview:
+    """What a post's web page offers for link previews: the picture and
+    description in its og: and twitter: meta tags."""
+    image: str = ""
+    description: str = ""
 
 
 @dataclass
@@ -113,6 +133,42 @@ async def fetch_feed(http: aiohttp.ClientSession, url: str,
         except TimeoutError as e:
             raise FeedError("timed out") from e
     raise FeedError("too many redirects")
+
+
+async def fetch_preview(http: aiohttp.ClientSession, url: str) -> PagePreview:
+    """The picture and description a post's page offers for link previews,
+    the same ones Discord's own preview card used. Fetched like a feed (the
+    same address checks and size limit). Empty when the page can't be
+    fetched; the card then uses what the feed has."""
+    try:
+        data = (await fetch_feed(http, url)).data or b""
+    except FeedError:
+        return PagePreview()
+    page = data.decode("utf-8", "replace")
+    end = page.lower().find("</head>")
+    tags = _MetaTags()
+    tags.feed(page[:end] if end >= 0 else page)
+    image = tags.first("og:image", "og:image:url", "twitter:image", "twitter:image:src")
+    return PagePreview(_web_address(image, url), _one_line(tags.first("og:description", "twitter:description",
+                                                                      "description")))
+
+
+class _MetaTags(HTMLParser):
+    """A page's <meta> tags by property or name (the first of each)."""
+
+    def __init__(self):
+        super().__init__()
+        self.found: dict[str, str] = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "meta":
+            attrs = dict(attrs)
+            name = (attrs.get("property") or attrs.get("name") or "").lower()
+            if name and attrs.get("content"):
+                self.found.setdefault(name, attrs["content"])
+
+    def first(self, *names: str) -> str:
+        return next((self.found[n] for n in names if n in self.found), "")
 
 
 # Zero-width and other invisible characters that ride along when links are
@@ -196,20 +252,34 @@ def select_new(items: list[FeedItem], seen: set[str], limit: int) -> list[FeedIt
     return new[-limit:] if limit else []
 
 
-def format_post(feed_title: str, item: FeedItem, author_id: str | None = None,
-                links_line: str | None = None) -> str:
-    """"Feed name - Post title" with the link below, which Discord turns into
-    a preview card. The same plain format MEE6 used, so the channel looks
-    unchanged after the switch, plus a credit for the author's Discord account
-    and, below the link, their profile links (profile_links.line)."""
-    title = discord.utils.escape_markdown(_one_line(item.title)[:MAX_TITLE_CHARS] or "New post")
-    head = f"{discord.utils.escape_markdown(_one_line(feed_title))} - {title}" if feed_title else title
+def post_card(feed_title: str, item: FeedItem, preview: PagePreview | None = None,
+              author_id: str | None = None, links_line: str | None = None) -> discord.Embed:
+    """A post as one card, like MEE6's: the blog's name on top, the title
+    linking to the post, a short summary, who wrote it and their profile links
+    (profile_links.line), then the picture. Nothing outside the card, so it
+    pings nobody. The picture and summary are the page's own link-preview
+    ones, else what the feed has."""
+    preview = preview or PagePreview()
+    url = _web_address(clean_url(item.link), item.link)
+    card = discord.Embed(title=_one_line(item.title)[:256] or "New post", url=url or None,
+                         color=discord.Color.blurple())
+    if feed_title:
+        card.set_author(name=_one_line(feed_title)[:256])
+    lines = []
+    summary = _shorten(preview.description or _plain_text(item.summary) or _plain_text(item.content))
+    if summary:
+        lines += [discord.utils.escape_mentions(discord.utils.escape_markdown(summary)), ""]
     if author_id:
-        head += f" · by <@{author_id}>"
-    text = f"{head}\n{clean_url(item.link)}"
+        lines.append(f"by <@{author_id}>")
+    elif item.writer:
+        lines.append(f"by {discord.utils.escape_mentions(discord.utils.escape_markdown(_one_line(item.writer)[:100]))}")
     if links_line:
-        text += f"\n{links_line}"
-    return text[:2000]
+        lines.append(links_line)
+    card.description = "\n".join(lines).strip() or None
+    image = preview.image or item.image or _first_image(item.link, item.content, item.summary)
+    if image:
+        card.set_image(url=image)
+    return card
 
 
 def word_list(setting: str | None) -> list[str]:
@@ -294,10 +364,12 @@ def _date(value: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _item(key: str, title: str, link: str, published: str) -> FeedItem | None:
+def _item(key: str, title: str, link: str, published: str, **card) -> FeedItem | None:
     if not link.startswith(("http://", "https://")):
         return None
-    return FeedItem(key or link, title, link, _date(published))
+    if card.get("image"):
+        card["image"] = _web_address(card["image"], link)
+    return FeedItem(key or link, title, link, _date(published), **card)
 
 
 def _rss_item(el) -> FeedItem | None:
@@ -305,7 +377,11 @@ def _rss_item(el) -> FeedItem | None:
     guid = _text(el.find("guid"))
     if not link and guid.startswith(("http://", "https://")):
         link = guid
-    return _item(guid, _text(el.find("title")), link, _text(el.find("pubDate")) or _text(el.find(DC + "date")))
+    # <author> is an e-mail address, with the name in brackets if at all.
+    named = re.search(r"\(([^)]+)\)", _text(el.find("author")))
+    return _item(guid, _text(el.find("title")), link, _text(el.find("pubDate")) or _text(el.find(DC + "date")),
+                 summary=_text(el.find("description")), content=_text(el.find(CONTENT + "encoded")),
+                 image=_media_image(el), writer=_text(el.find(DC + "creator")) or (named.group(1) if named else ""))
 
 
 def _atom_entry(el) -> FeedItem | None:
@@ -315,9 +391,83 @@ def _atom_entry(el) -> FeedItem | None:
             link = candidate.get("href")
             break
     published = _text(el.find(ATOM + "published")) or _text(el.find(ATOM + "updated"))
-    return _item(_text(el.find(ATOM + "id")), _text(el.find(ATOM + "title")), link, published)
+    return _item(_text(el.find(ATOM + "id")), _text(el.find(ATOM + "title")), link, published,
+                 summary=_text(el.find(ATOM + "summary")), content=_text(el.find(ATOM + "content")),
+                 image=_media_image(el), writer=_text(el.find(f"{ATOM}author/{ATOM}name")))
 
 
 def _rdf_item(el) -> FeedItem | None:
     link = _text(el.find(RSS1 + "link"))
-    return _item(el.get(RDF + "about", ""), _text(el.find(RSS1 + "title")), link, _text(el.find(DC + "date")))
+    return _item(el.get(RDF + "about", ""), _text(el.find(RSS1 + "title")), link, _text(el.find(DC + "date")),
+                 summary=_text(el.find(RSS1 + "description")), writer=_text(el.find(DC + "creator")))
+
+
+def _media_image(el) -> str:
+    """The picture a feed names for an item: Media RSS (Ghost, WordPress
+    plugins, YouTube) or an image enclosure (Substack). Videos don't count."""
+    for tag in (MEDIA + "content", MEDIA + "thumbnail", "enclosure", ATOM + "link"):
+        for media in el.iter(tag):
+            url = media.get("href") if tag == ATOM + "link" else media.get("url")
+            kind = media.get("type") or ""
+            if tag == ATOM + "link" and media.get("rel") != "enclosure":
+                continue
+            if url and (kind.startswith("image/") or media.get("medium") == "image"
+                        or (tag == MEDIA + "thumbnail") or (not kind and _IMAGE_FILE.search(url))):
+                return url
+    return ""
+
+
+_IMAGE_FILE = re.compile(r"\.(jpe?g|png|gif|webp|avif)(\?|$)", re.I)
+_IMG_TAG = re.compile(r"<img\b[^>]*>", re.I)
+# Avatars, smileys and tracking pixels that blogs put in their posts.
+_NOT_A_PICTURE = ("gravatar.com", "/emoji/", "s.w.org/images", "feeds.feedburner.com", "stats.wp.com",
+                  "pixel.wp.com", "/wp-includes/images/")
+
+
+def _first_image(base: str, *html_texts: str) -> str:
+    """The first real picture in a post's HTML, as an absolute address."""
+    for text in html_texts:
+        for tag in _IMG_TAG.findall(text or ""):
+            src = _attribute(tag, "src")
+            if not src or any(junk in src for junk in _NOT_A_PICTURE):
+                continue
+            if _attribute(tag, "width") in ("0", "1") or _attribute(tag, "height") in ("0", "1"):
+                continue
+            if url := _web_address(src, base):
+                return url
+    return ""
+
+
+def _attribute(tag: str, name: str) -> str:
+    found = re.search(rf"\s{name}\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", tag, re.I)
+    return html.unescape(next(g for g in found.groups() if g is not None)) if found else ""
+
+
+def _web_address(raw: str, base: str) -> str:
+    """An address made absolute and safe to hand to Discord (spaces and
+    other letters encoded), or "" if it isn't a usable http(s) one."""
+    url = urljoin(base, raw.strip()) if raw else ""
+    if urlsplit(url).scheme not in ("http", "https") or len(url) > 2000:
+        return ""
+    return quote(url, safe=":/?#[]@!$&'()*+,;=%~")
+
+
+def _plain_text(markup: str) -> str:
+    """A post's HTML summary as one line of text, without the "The post …
+    appeared first on …" footer WordPress adds; a trailing [...] or "Continue
+    reading" becomes …."""
+    if not markup:
+        return ""
+    text = re.sub(r"<(script|style)\b.*?</\1\s*>|<[^>]+>", " ", markup, flags=re.S | re.I)
+    text = _one_line(html.unescape(text))
+    text = re.sub(r"\s*The post .{1,300}? appeared first on .{1,200}$", "", text)
+    text, cut = re.subn(r"\s*(\[(…|\.\.\.)\]|Continue reading\b.*|Read more\b.*)$", "", text)
+    return text + ("…" if cut and not text.endswith((".", "!", "?", "…")) else "")
+
+
+def _shorten(text: str, limit: int = MAX_SUMMARY_CHARS) -> str:
+    """Text cut at a word to at most `limit` characters, with … if cut."""
+    text = _one_line(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,.;:-–—") + "…"

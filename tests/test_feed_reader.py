@@ -13,7 +13,7 @@ from aiohttp.test_utils import TestServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import feed_reader  # noqa: E402
-from feed_reader import FeedError, FeedItem, format_post, parse_feed, select_new  # noqa: E402
+from feed_reader import FeedError, FeedItem, PagePreview, parse_feed, post_card, select_new  # noqa: E402
 
 RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>
@@ -47,6 +47,34 @@ RDF = b"""<?xml version="1.0"?>
 </rdf:RDF>"""
 
 
+# What the cards are made of, as real blogs write it: WordPress (summary,
+# full post, author, picture only inside the post), Ghost (media:content),
+# Substack (an image enclosure) and YouTube's Atom (media:group thumbnail).
+CARD_RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>Blog</title>
+  <item><title>WordPress</title><link>https://wp.example/2026/post/</link><dc:creator>Peter</dc:creator>
+    <description><![CDATA[<p>Intro &amp; more [&#8230;]</p><p>The post WordPress appeared first on Blog.</p>]]></description>
+    <content:encoded><![CDATA[<img src="https://secure.gravatar.com/avatar/1.png"><p>Hi</p>
+      <img width="1" height="1" src="https://pixel.example/t.gif"><img src="/wp-content/uploads/shot one.png">]]></content:encoded></item>
+  <item><title>Ghost</title><link>https://ghost.example/post/</link><author>sky@example.com (Sky)</author>
+    <media:content url="https://ghost.example/content/images/cover.jpg" medium="image"/></item>
+  <item><title>Substack</title><link>https://sub.example/p/post</link>
+    <enclosure url="https://substackcdn.com/image/fetch/cover.jpeg" length="0" type="image/jpeg"/></item>
+</channel></rss>"""
+
+CARD_ATOM = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/"><title>Channel</title>
+  <entry><id>yt:video:abc</id><title>Video</title><link rel="alternate" href="https://www.youtube.com/watch?v=abc"/>
+    <author><name>Some Channel</name></author>
+    <media:group><media:content url="https://www.youtube.com/v/abc" type="application/x-shockwave-flash"/>
+      <media:thumbnail url="https://i.ytimg.com/vi/abc/hqdefault.jpg"/><media:description>About it</media:description>
+    </media:group></entry>
+  <entry><id>tag:x,2026:2</id><title>Hugo</title><link href="https://hugo.example/post/"/>
+    <summary type="html">&lt;p&gt;A static site's summary&lt;/p&gt;</summary></entry>
+</feed>"""
+
+
 def item(key, published=None):
     return FeedItem(key, key, f"https://example.com/{key}", published)
 
@@ -68,6 +96,20 @@ class ParseTests(unittest.TestCase):
                          [("yt:video:abc", "https://www.youtube.com/watch?v=abc"),
                           ("tag:x,2026:2", "https://example.com/post")])
         self.assertEqual(items[1].published, datetime(2026, 10, 14, 10, tzinfo=timezone.utc))
+
+    def test_what_cards_need_from_rss(self):
+        wordpress, ghost, substack = parse_feed(CARD_RSS)[1]
+        self.assertEqual(wordpress.writer, "Peter")
+        self.assertIn("Intro &amp; more", wordpress.summary)  # kept as HTML until a card needs it
+        self.assertEqual(wordpress.image, "")  # its picture is only inside the post
+        self.assertEqual((ghost.writer, ghost.image), ("Sky", "https://ghost.example/content/images/cover.jpg"))
+        self.assertEqual(substack.image, "https://substackcdn.com/image/fetch/cover.jpeg")
+
+    def test_what_cards_need_from_atom(self):
+        video, hugo = parse_feed(CARD_ATOM)[1]
+        self.assertEqual((video.writer, video.image), ("Some Channel", "https://i.ytimg.com/vi/abc/hqdefault.jpg"))
+        self.assertEqual((hugo.writer, hugo.image), ("", ""))
+        self.assertIn("summary", hugo.summary)
 
     def test_rss1_rdf(self):
         title, items = parse_feed(RDF)
@@ -106,11 +148,34 @@ class SelectAndFormatTests(unittest.TestCase):
         items = [item("new"), item("mid"), item("old")]
         self.assertEqual([i.key for i in select_new(items, set(), 5)], ["old", "mid", "new"])
 
-    def test_format_post(self):
-        post = format_post("My *Blog*", FeedItem("k", "  A\n  __title__ ", "https://x.com/p?utm_source=rss&id=1", None))
-        self.assertEqual(post, "My \\*Blog\\* - A \\_\\_title\\_\\_\nhttps://x.com/p?id=1")
-        self.assertTrue(format_post("", item("t"), author_id="7").startswith("t · by <@7>\n"))
-        self.assertLessEqual(len(format_post("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))), 2000)
+    def test_post_card(self):
+        card = post_card("My Blog", FeedItem("k", "  A\n title ", "https://x.com/p?utm_source=rss&id=1", None),
+                         PagePreview("https://x.com/cover.png", "What it's about"), author_id="7", links_line="links")
+        self.assertEqual((card.author.name, card.title, card.url), ("My Blog", "A title", "https://x.com/p?id=1"))
+        self.assertEqual(card.description, "What it's about\n\nby <@7>\nlinks")
+        self.assertEqual(card.image.url, "https://x.com/cover.png")
+        self.assertIsNone(post_card("", item("t")).description)  # nothing to say: just the title
+
+    def test_card_falls_back_to_what_the_feed_has(self):
+        wordpress, ghost, _ = parse_feed(CARD_RSS)[1]
+        card = post_card("Blog", wordpress)
+        self.assertEqual(card.description, "Intro & more…\n\nby Peter")  # no WordPress footer; the feed's writer
+        self.assertEqual(card.image.url, "https://wp.example/wp-content/uploads/shot%20one.png")  # not the avatar or pixel
+        self.assertEqual(post_card("Blog", ghost).image.url, "https://ghost.example/content/images/cover.jpg")
+        self.assertEqual(post_card("Blog", ghost, author_id="7").description, "by <@7>")  # the member, not the name
+
+    def test_card_summary_is_short_and_harmless(self):
+        long = FeedItem("k", "t", "https://x.com/p", None, summary="word " * 100)
+        summary = post_card("F", long).description
+        self.assertLessEqual(len(summary), feed_reader.MAX_SUMMARY_CHARS)
+        self.assertTrue(summary.endswith("word…"))
+        sneaky = FeedItem("k", "t", "https://x.com/p", None, summary="@everyone see [this](https://evil.example) **now**")
+        text = post_card("F", sneaky).description
+        self.assertNotIn("@everyone", text)
+        self.assertIn("\\[this](https://evil.example)", text)  # shown as text, not a hidden link
+        self.assertIn("\\*\\*now\\*\\*", text)
+        huge = post_card("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))
+        self.assertEqual((len(huge.title), huge.url), (256, None))  # too long to link, but still posts
 
     def test_word_filters(self):
         self.assertEqual(feed_reader.word_list(" Chromium, ,Remote Code Execution "), ["chromium", "remote code execution"])
@@ -169,6 +234,12 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_get("/maintenance", lambda r: web.Response(
             status=503, headers={"Retry-After": email.utils.format_datetime(datetime.now(timezone.utc) + timedelta(hours=2), usegmt=True)}))
         app.router.add_get("/down", lambda r: web.Response(status=503))
+        app.router.add_get("/post", lambda r: web.Response(content_type="text/html", text=(
+            "<html><head><meta name='description' content='Plain description'>"
+            "<meta content=\"/images/cover.png?v=1&amp;w=1200\" property=\"og:image\">"
+            "<meta property=\"og:description\" content=\"Shared  description\"></head>"
+            "<body><meta property='og:image' content='https://late.example/no.png'></body></html>")))
+        app.router.add_get("/bare", lambda r: web.Response(content_type="text/html", text="<html><p>Hi</p></html>"))
         self.server = TestServer(app, host="127.0.0.1")
         await self.server.start_server()
         # The local server is (rightly) not a public address, so let it through.
@@ -221,6 +292,13 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(FeedError) as ctx:  # a plain 503 is just an error, retried next check
             await feed_reader.fetch_feed(self.http, self.url("/down"))
         self.assertNotIsInstance(ctx.exception, feed_reader.RateLimited)
+
+    async def test_preview_reads_the_pages_meta_tags(self):
+        preview = await feed_reader.fetch_preview(self.http, self.url("/post"))
+        self.assertEqual(preview, PagePreview(self.url("/images/cover.png?v=1&w=1200"), "Shared description"))
+        self.assertEqual(await feed_reader.fetch_preview(self.http, self.url("/bare")), PagePreview())
+        for path in ("/broken", "/evil", "/slow-down"):  # the card just uses the feed's own
+            self.assertEqual(await feed_reader.fetch_preview(self.http, self.url(path)), PagePreview())
 
     def test_retry_after_is_kept_between_a_minute_and_six_hours(self):
         self.assertEqual(feed_reader._retry_after_seconds("5"), 60)

@@ -1,6 +1,8 @@
 # Run from the repo root: venv/bin/python -m unittest discover -s tests -v
 # Exercises the /feed polling logic against a throwaway database and a fake
-# Discord channel. No network: fetch_feed is replaced with canned feeds.
+# Discord channel. No network: fetch_feed is replaced with canned feeds,
+# and posts' page previews (fetch_preview) come back empty unless a test
+# gives one.
 
 import asyncio
 import os
@@ -39,20 +41,30 @@ def rss(*keys):
 SKIPPY_ID = 1473839815643369686
 
 
+def setUpModule():
+    patcher = mock.patch.object(feed_reader, "fetch_preview", mock.AsyncMock(return_value=feed_reader.PagePreview()))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 class FakeChannel:
     def __init__(self, channel_id=CHANNEL_ID):
         self.id, self.sent, self.fail_on, self.threads = channel_id, [], set(), []
         self.mention = f"<#{channel_id}>"
         self.embeds, self.votes_added, self.messages = [], [], {}
-        self.thread_error = None
+        self.thread_error, self.refuse_pictures = None, False
 
     async def send(self, content=None, allowed_mentions=None, embed=None, view=None):
-        if embed is not None:
+        """Posts (a post's card, which links to it, or a summary's text) land
+        in `sent`; other cards, like a suggestion's, in `embeds`."""
+        if embed is not None and not embed.url:
             self.embeds.append(embed)
             return mock.Mock()
-        if any(f"/{k}\n" in content + "\n" for k in self.fail_on):
+        if embed is not None and embed.url.rsplit("/", 1)[1] in self.fail_on:
             raise discord.HTTPException(mock.Mock(status=503, reason="unavailable"), "down")
-        self.sent.append((content, allowed_mentions))
+        if embed is not None and embed.image.url and self.refuse_pictures:
+            raise discord.HTTPException(mock.Mock(status=400, reason="Bad Request"), "Not a well formed URL")
+        self.sent.append((embed or content, allowed_mentions))
         message_id = len(self.sent)
 
         async def create_thread(name, auto_archive_duration):
@@ -107,7 +119,7 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
         return fetch
 
     def posted(self):
-        return [content.rsplit("/", 1)[1] for content, _ in self.channel.sent]
+        return [card.url.rsplit("/", 1)[1] for card, _ in self.channel.sent]
 
 
 class FeedPollTests(FeedTestCase):
@@ -116,9 +128,10 @@ class FeedPollTests(FeedTestCase):
         self.assertEqual(self.posted(), [])
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])
-        content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("Blog - Post c\n"))
-        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)  # no author to credit
+        card, mentions = self.channel.sent[0]
+        self.assertEqual((card.author.name, card.title, card.url), ("Blog", "Post c", "https://example.com/c"))
+        self.assertIsNone(card.description)  # no summary in the feed, no author to credit
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])  # nothing posts twice
 
@@ -222,12 +235,12 @@ class FeedPollTests(FeedTestCase):
 
 class CommunityTests(FeedTestCase):
 
-    async def test_author_is_credited_and_pinged(self):
+    async def test_author_is_credited_without_a_ping(self):
         await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
         await self.check(rss("c", "a", "b"))
-        content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("Blog - Post c · by <@77>\n"))
-        self.assertEqual([u.id for u in mentions.users], [77])
+        card, mentions = self.channel.sent[0]
+        self.assertEqual(card.description, "by <@77>")
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)  # mentions in a card never ping
 
     async def test_linking_an_author_watches_them_without_resetting_history(self):
         await db.add_to_watchlist("77", "1", "9")
@@ -251,16 +264,16 @@ class CommunityTests(FeedTestCase):
         self.assertIn("e", await db.get_seen_feed_items(self.feed_id))  # ... and counted as posted
 
 
-    async def test_add_posts_the_newest_item_without_pings(self):
+    async def test_add_posts_the_newest_item(self):
         await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
         _, items = feed_reader.parse_feed(rss("new", "old").data)
         self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel))
         i = interaction()
         await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(len(self.channel.sent), 1)
-        content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("Blog - Post new · by <@77>\n"))  # looks like a normal post ...
-        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)   # ... but pings nobody
+        card, mentions = self.channel.sent[0]
+        self.assertEqual((card.title, card.description), ("Post new", "by <@77>"))  # like any post
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
         self.assertEqual([r["title"] for r in await db.search_feed_posts(["new"])], ["Post new"])
         self.assertIn("Posted its newest item", i.followup.send.await_args.args[0])
 
@@ -270,6 +283,28 @@ class CommunityTests(FeedTestCase):
         await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(self.channel.sent, [])
         self.assertIn("✅ Added", i.followup.send.await_args.args[0])
+
+
+class PostCardTests(FeedTestCase):
+    """Posts are one card: the page's preview picture and description when it
+    has them, the feed's otherwise."""
+
+    async def test_card_uses_the_posts_page_preview(self):
+        preview = feed_reader.PagePreview("https://img.example/cover.png", "What the page says")
+        with mock.patch.object(feed_reader, "fetch_preview", mock.AsyncMock(return_value=preview)) as fetch:
+            await self.check(rss("c", "a", "b"))
+        self.assertEqual(fetch.await_args.args[1], "https://example.com/c")
+        card = self.channel.sent[0][0]
+        self.assertEqual((card.description, card.image.url), ("What the page says", "https://img.example/cover.png"))
+
+    async def test_a_picture_discord_refuses_doesnt_stop_the_post(self):
+        self.channel.refuse_pictures = True
+        preview = feed_reader.PagePreview("https://img.example/bad picture.png", "")
+        with mock.patch.object(feed_reader, "fetch_preview", mock.AsyncMock(return_value=preview)):
+            await self.check(rss("c", "a", "b"))
+        self.assertEqual(self.posted(), ["c"])
+        self.assertIsNone(self.channel.sent[0][0].image.url)
+        self.assertIn("c", await db.get_seen_feed_items(self.feed_id))
 
 
 class ActivityRuleTests(FeedTestCase):
@@ -495,7 +530,7 @@ class FeedNameTests(FeedTestCase):
     async def test_display_name_replaces_the_feeds_own_title(self):
         await db.update_feed(self.feed_id, "1", display_name="CirriusTech")
         await self.check(rss("c", "a", "b"))
-        self.assertTrue(self.channel.sent[0][0].startswith("CirriusTech - Post c\n"))
+        self.assertEqual(self.channel.sent[0][0].author.name, "CirriusTech")
         self.assertEqual((await db.search_feed_posts(["post", "c"]))[0]["feed_title"], "CirriusTech")
         feed = await db.get_feed(self.feed_id, "1")
         self.assertEqual(feeds.feed_name(feed), "CirriusTech")
@@ -507,7 +542,7 @@ class FeedNameTests(FeedTestCase):
         await feeds.FeedCommands.feed_add.callback(self.cog, interaction(), "<\u200bcirriustech.co.uk/blog/index.xml>",
                                                    name="CirriusTech")
         self.assertEqual(self.cog._create_feed.await_args.args[1], "https://cirriustech.co.uk/blog/index.xml")
-        self.assertTrue(self.channel.sent[0][0].startswith("CirriusTech - Post new\n"))
+        self.assertEqual(self.channel.sent[0][0].author.name, "CirriusTech")
 
     async def test_edit_sets_and_clears_the_name(self):
         i = interaction()
@@ -723,15 +758,14 @@ class ProfileLinkTests(FeedCommandTestCase):
         await feeds.FeedCommands.blog_links.callback(self.cog, i, **options)
         return i.response.send_message.await_args.args[0]
 
-    async def test_posts_show_the_authors_links_without_extra_previews(self):
+    async def test_posts_show_the_authors_links_under_the_credit(self):
         await db.set_author_links("77", {"linkedin": self.LINKEDIN, "x": "https://x.com/jonasb"})
         del self.cog._post  # post for real
         await self.check(rss("c", "a", "b"))
-        content = self.channel.sent[0][0]
         emoji = feeds.FEED_LINK_EMOJIS
-        self.assertEqual(content.split("\n")[-1], f"{emoji['linkedin']} [jonas-b](<{self.LINKEDIN}>)  "
-                                                   f"{emoji['x']} [@jonasb](<https://x.com/jonasb>)")
-        self.assertIn("\nhttps://example.com/c\n", content)  # the blog's own link still gets the preview card
+        self.assertEqual(self.channel.sent[0][0].description.split("\n"),
+                         ["by <@77>", f"{emoji['linkedin']} [jonas-b](<{self.LINKEDIN}>)  "
+                                      f"{emoji['x']} [@jonasb](<https://x.com/jonasb>)"])
 
     async def test_suggestion_carries_links_to_the_card_and_approval_saves_them(self):
         await self.suggest("https://new.example/feed", user_id="300", linkedin="jonas-b")
@@ -791,7 +825,7 @@ class ConsistentPostsTests(FeedTestCase):
         self.assertEqual(len(self.channel.sent), 1)
         self.assertEqual(len(self.channel.votes_added), 1)
         self.assertEqual(self.channel.threads, ["Post new"])
-        self.assertFalse(self.channel.sent[0][1].roles)  # still no pings for a test
+        self.assertFalse(self.channel.sent[0][1].users or self.channel.sent[0][1].roles)  # no pings
         self.assertEqual([r["title"] for r in await db.search_feed_posts(["new"])], ["Post new"])  # archived
         self.assertIn("test-posted feed #1 **Blog**", self.alerts.sent[-1][0])  # mods see it
 
@@ -876,7 +910,7 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"Approved by <@500>: feed #{self.feed_id}", card["embed"].fields[-1].value)
         self.assertIn("approved", self.cog._dm.await_args.args[1])
         self.assertEqual(len(self.channel.sent), 1)  # the blog's newest article, as a welcome
-        self.assertTrue(self.channel.sent[0][0].startswith("My Blog - Post latest\n"))
+        self.assertEqual((self.channel.sent[0][0].author.name, self.channel.sent[0][0].title), ("My Blog", "Post latest"))
 
     async def test_another_members_blog_credits_them_and_tells_both(self):
         sid = await db.add_suggestion("1", "https://other.example/feed", "Other", "300", "301", None)
