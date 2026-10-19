@@ -32,7 +32,8 @@ discussion thread. Microsoft's blogs, service status and CVEs go to
 
 - Vote for your favourite posts with the :msems: reaction. Every Monday at
   09:00 the roundup in **#general** recaps the week and crowns the top 3.
-- Write a blog? `/blog suggest` it, and a moderator will add it.
+- Write a blog, or know a member who does? `/blog suggest` it, and a moderator
+  will add it.
 - Looking for something? `/blog search` searches everything Skippy has posted.
 
 ### 🛡️ Keeps the server safe

@@ -44,7 +44,7 @@ def member_help() -> discord.Embed:
             "`/trial @user` - Put someone on trial for ghosting. Court is in session.\n"
             "`/roulette` - Skippy picks today's most likely ghoster. Nobody is safe.\n"
             "`/slap @user` - Slap someone. In the name of Skippy.\n"
-            "`/blog suggest <feed url>` - Suggest your blog for the community feed\n"
+            "`/blog suggest <feed url> <author>` - Suggest a member's blog (yours or someone else's) for the community feed\n"
             "`/blog search <words>` - Search everything the feeds have posted\n"
             "`/help` - This message"
         ),
@@ -136,7 +136,8 @@ def moderator_help() -> discord.Embed:
     embed.add_field(
         name="📬 Blog suggestions and search",
         value=(
-            f"`/blog suggest <url>` (*everyone*) - the card lands in {mod_audit} to approve or reject\n"
+            f"`/blog suggest <url> <author>` (*everyone*) - members' blogs only: they pick the member who "
+            f"writes it, even if it's themselves; the card lands in {mod_audit} to approve or reject\n"
             "`/blog search <words>` (*everyone*) - everything the feeds have posted"
         ),
         inline=False

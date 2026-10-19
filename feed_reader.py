@@ -130,6 +130,26 @@ def normalize_url(raw: str) -> str:
     return url
 
 
+def comparable_url(url: str) -> str:
+    """A feed URL reduced to what identifies the feed, so the same feed written
+    differently (http or https, www., a trailing slash, tracking parameters,
+    upper-case host) compares equal."""
+    parts = urlsplit(clean_url(normalize_url(url)))
+    host = (parts.hostname or "").removeprefix("www.")  # hostname is lower-case already
+    try:
+        port = f":{parts.port}" if parts.port not in (None, 80, 443) else ""
+    except ValueError:
+        port = ""
+    return host + port + parts.path.rstrip("/") + (f"?{parts.query}" if parts.query else "")
+
+
+def item_ids(items: list[FeedItem]) -> set[str]:
+    """Everything that identifies a feed's items: their keys and links. Two
+    feeds sharing any of these carry the same posts, like a blog's /feed and
+    /rss addresses."""
+    return {i.key for i in items} | {i.link for i in items} | {clean_url(i.link) for i in items}
+
+
 def parse_feed(data: bytes) -> tuple[str, list[FeedItem]]:
     """Return (feed title, items in document order) for RSS 2.0, RSS 1.0 or Atom."""
     # Real feeds never declare entities; refusing them rules out entity
