@@ -6,7 +6,7 @@
 # ============================================================
 
 import re
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from feed_reader import normalize_url
 
@@ -79,9 +79,10 @@ def line(links: dict[str, str], emojis: dict[str, str]) -> str:
 
 def handle(url: str) -> str:
     """How a profile is shown: @name on X and YouTube, the name on LinkedIn
-    and GitHub, "channel" for a YouTube channel without a handle."""
+    and GitHub, "channel" for a YouTube channel without a handle. Letters
+    like ë are shown as letters, not as the %C3%AB in the address."""
     parts = urlsplit(url)
-    name = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    name = unquote(parts.path.rstrip("/").rsplit("/", 1)[-1])
     if parts.hostname == "x.com":
         return "@" + name
     if parts.path.startswith("/channel/"):

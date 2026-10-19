@@ -108,9 +108,14 @@ class SelectAndFormatTests(unittest.TestCase):
 
     def test_format_post(self):
         post = format_post("My *Blog*", FeedItem("k", "  A\n  __title__ ", "https://x.com/p?utm_source=rss&id=1", None))
-        self.assertEqual(post, "My \\*Blog\\* - A \\_\\_title\\_\\_\nhttps://x.com/p?id=1")
-        self.assertTrue(format_post("", item("t"), author_id="7").startswith("t · by <@7>\n"))
-        self.assertLessEqual(len(format_post("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))), 2000)
+        self.assertEqual(post, "My \\*Blog\\* - [A \\_\\_title\\_\\_](https://x.com/p?id=1)")  # no bare address
+        self.assertEqual(format_post("", item("t"), author_id="7", links_line="links"),
+                         "[t](https://example.com/t) · by <@7>\nlinks")
+        tricky = FeedItem("k", "[Video] Intune (2026)", "https://e.com/wiki/Intune_(software)", None)
+        self.assertEqual(format_post("F", tricky), "F - [(Video) Intune (2026)](https://e.com/wiki/Intune_%28software%29)")
+        huge = format_post("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))
+        self.assertLessEqual(len(huge), 2000)
+        self.assertIn("\nhttps://x.com/yyy", huge)  # too long to mask: the address is shown instead
 
     def test_word_filters(self):
         self.assertEqual(feed_reader.word_list(" Chromium, ,Remote Code Execution "), ["chromium", "remote code execution"])

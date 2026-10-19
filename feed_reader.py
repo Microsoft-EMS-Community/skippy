@@ -198,17 +198,19 @@ def select_new(items: list[FeedItem], seen: set[str], limit: int) -> list[FeedIt
 
 def format_post(feed_title: str, item: FeedItem, author_id: str | None = None,
                 links_line: str | None = None) -> str:
-    """"Feed name - Post title" with the link below, which Discord turns into
-    a preview card. The same plain format MEE6 used, so the channel looks
-    unchanged after the switch, plus a credit for the author's Discord account
-    and, below the link, their profile links (profile_links.line)."""
-    title = discord.utils.escape_markdown(_one_line(item.title)[:MAX_TITLE_CHARS] or "New post")
-    head = f"{discord.utils.escape_markdown(_one_line(feed_title))} - {title}" if feed_title else title
-    if author_id:
-        head += f" · by <@{author_id}>"
-    text = f"{head}\n{clean_url(item.link)}"
+    """"Feed name - Post title", the title linking to the post. Discord turns
+    the link into a preview card below, so, like MEE6's posts, the address
+    itself isn't shown. Plus a credit for the author's Discord account and,
+    on the next line, their profile links (profile_links.line)."""
+    name = f"{discord.utils.escape_markdown(_one_line(feed_title))} - " if feed_title else ""
+    url = clean_url(item.link)
+    credit = f" · by <@{author_id}>" if author_id else ""
+    # A ")" in the address would end the masked link early.
+    text = f"{name}[{_link_text(item)}]({url.replace('(', '%28').replace(')', '%29')}){credit}"
     if links_line:
         text += f"\n{links_line}"
+    if len(text) > 2000:  # only with a huge address: show it, so the post still links somewhere
+        text = f"{name}{_link_text(item)}{credit}\n{url}"
     return text[:2000]
 
 
@@ -240,9 +242,7 @@ def format_summary(feed_title: str, items: list[FeedItem], highlight: list[str],
 
     messages, current = [], header
     for index, item in enumerate(ordered):
-        # Square brackets would end the masked link early.
-        plain = _one_line(item.title)[:MAX_TITLE_CHARS].replace("[", "(").replace("]", ")")
-        title = discord.utils.escape_markdown(plain or "New post")
+        title = _link_text(item)
         if mentions_any(item, highlight):
             title = f"**{title}**"
         # <url> inside a masked link stops Discord from adding a preview card per line.
@@ -257,6 +257,13 @@ def format_summary(feed_title: str, items: list[FeedItem], highlight: list[str],
             current = f"{current}\n{line}"
     messages.append(current)
     return messages
+
+
+def _link_text(item: FeedItem) -> str:
+    """An item's title as the text of a masked link: one line, escaped, and
+    without square brackets, which would end the link early."""
+    plain = _one_line(item.title)[:MAX_TITLE_CHARS].replace("[", "(").replace("]", ")")
+    return discord.utils.escape_markdown(plain or "New post")
 
 
 def _retry_after_seconds(value: str | None) -> int:
