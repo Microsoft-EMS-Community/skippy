@@ -249,7 +249,7 @@ class FeedCommands(commands.Cog):
             raise FeedError(f"I can't post in {channel.mention}: I need View Channel, Send Messages and Embed Links there")
         async with feed_reader.session() as http:
             result = await feed_reader.fetch_feed(http, url)
-            title, items = feed_reader.parse_feed(result.data)
+            title, items = feed_reader.parse_feed(result.data, url)
         duplicate = await self._duplicate_of(str(guild.id), url, feed_reader.item_ids(items), channel.id)
         if duplicate:
             raise FeedError(f"that's the same blog as feed #{duplicate['id']} **{self._name(duplicate)}**, "
@@ -574,7 +574,7 @@ class FeedCommands(commands.Cog):
             return
         async with feed_reader.session() as http:
             try:
-                title, items = feed_reader.parse_feed((await feed_reader.fetch_feed(http, url)).data)
+                title, items = feed_reader.parse_feed((await feed_reader.fetch_feed(http, url)).data, url)
             except FeedError as e:
                 await self._refuse(interaction, url, author,
                                    f"I couldn't read that as a feed: {e}. Look for the blog's RSS or Atom link; "
@@ -783,7 +783,7 @@ class FeedCommands(commands.Cog):
             return
         async with feed_reader.session() as http:
             try:
-                title, items = feed_reader.parse_feed((await feed_reader.fetch_feed(http, row["url"])).data)
+                title, items = feed_reader.parse_feed((await feed_reader.fetch_feed(http, row["url"])).data, row["url"])
             except FeedError as e:
                 await interaction.followup.send(f"Couldn't read the feed: {e}.", ephemeral=True)
                 return
@@ -850,7 +850,7 @@ class FeedCommands(commands.Cog):
             if result.data is None:  # 304 Not Modified
                 await self._record_success(feed)
                 return
-            title, items = feed_reader.parse_feed(result.data)
+            title, items = feed_reader.parse_feed(result.data, feed["url"])
         except FeedError as e:
             if isinstance(e, RateLimited):
                 self.skip_until[feed["id"]] = time.monotonic() + e.retry_after
