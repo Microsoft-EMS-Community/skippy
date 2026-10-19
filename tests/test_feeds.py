@@ -730,8 +730,8 @@ class ProfileLinkTests(FeedCommandTestCase):
         await self.check(rss("c", "a", "b"))
         content = self.channel.sent[0][0]
         emoji = feeds.FEED_LINK_EMOJIS
-        self.assertEqual(content.split("\n")[-1], f"{emoji['linkedin']} [LinkedIn](<{self.LINKEDIN}>) · "
-                                                   f"{emoji['x']} [X](<https://x.com/jonasb>)")
+        self.assertEqual(content.split("\n")[-1], f"[{emoji['linkedin']}](<{self.LINKEDIN}>) "
+                                                   f"[{emoji['x']}](<https://x.com/jonasb>)")
         self.assertIn("\nhttps://example.com/c\n", content)  # the blog's own link still gets the preview card
 
     async def test_suggestion_carries_links_to_the_card_and_approval_saves_them(self):
@@ -764,7 +764,7 @@ class ProfileLinkTests(FeedCommandTestCase):
         self.assertIn("✅ Saved", await self.links_command(x="@jonasb", linkedin="jonas-b"))
         self.assertEqual(self.alerts.sent[-1][0], "🛠️ <@77> changed their profile links: "
                                                   f"LinkedIn <{self.LINKEDIN}>, X <https://x.com/jonasb>")
-        self.assertIn("[X](<https://x.com/jonasb>)", await self.links_command())  # no options: shows them
+        self.assertIn("](<https://x.com/jonasb>)", await self.links_command())  # no options: shows them
         await self.links_command(clear="all")
         self.assertEqual(await db.get_author_links("77"), {})
 

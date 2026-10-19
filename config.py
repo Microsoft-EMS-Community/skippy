@@ -75,7 +75,7 @@ FEED_VOTE_EMOJI = "<:msems:1368551524963192842>"
 FEED_LINK_EMOJIS = {
     "linkedin": "💼",
     "x": "<:x_:1561698449114800208>",
-    "youtube": "▶️",
+    "youtube": "<:youtube:1561700836634263572>",
     "github": "<:tool_github:1031898235167576094>",
 }
 

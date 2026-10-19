@@ -47,7 +47,7 @@ class NormalizeTests(unittest.TestCase):
     def test_line_in_a_fixed_order_without_preview_cards(self):
         links = {"github": "https://github.com/a", "linkedin": "https://www.linkedin.com/in/a"}
         self.assertEqual(profile_links.line(links, {"linkedin": "💼"}),
-                         "💼 [LinkedIn](<https://www.linkedin.com/in/a>) · 🔗 [GitHub](<https://github.com/a>)")
+                         "[💼](<https://www.linkedin.com/in/a>) [🔗](<https://github.com/a>)")
         self.assertEqual(profile_links.line({}, {}), "")
 
 

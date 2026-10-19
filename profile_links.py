@@ -69,10 +69,9 @@ def normalize(site: str, raw: str) -> str:
 
 
 def line(links: dict[str, str], emojis: dict[str, str]) -> str:
-    """The line under a post: "💼 LinkedIn · 𝕏 X · ...", each a link that
-    doesn't add its own preview card. Empty when there are no links."""
-    return " · ".join(f"{emojis.get(site, '🔗')} [{label}](<{links[site]}>)"
-                      for site, label in SITES.items() if links.get(site))
+    """The line under a post: each site's icon, clickable, linking to the
+    profile without adding its own preview card. Empty when there are no links."""
+    return " ".join(f"[{emojis.get(site, '🔗')}](<{links[site]}>)" for site in SITES if links.get(site))
 
 
 def _wrong(site: str) -> str:
