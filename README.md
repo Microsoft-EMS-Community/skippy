@@ -33,7 +33,8 @@ discussion thread. Microsoft's blogs, service status and CVEs go to
 - Vote for your favourite posts with the :msems: reaction. Every Monday at
   09:00 the roundup in **#general** recaps the week and crowns the top 3.
 - Write a blog, or know a member who does? `/blog suggest` it, and a moderator
-  will add it.
+  will add it. Your posts can link to your LinkedIn, X, YouTube and GitHub
+  too (`/blog links`).
 - Looking for something? `/blog search` searches everything Skippy has posted.
 
 ### 🛡️ Keeps the server safe
@@ -62,6 +63,8 @@ full guide there.
   - **Bloggers on the feed and members on the watchlist:** when and where they
     posted (a link, never the text), so moderators can see who's active.
     Cleared out every month.
+  - **Profile links** bloggers add to their posts, until they remove them or
+    their blog leaves the feed.
   - **Its log of actions** is kept for 90 days, and its technical log for 7.
 - **Every change is checked.** All of Skippy's code is public, right here.
   Each change is reviewed by a moderator and has to pass the automated tests
