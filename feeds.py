@@ -222,6 +222,10 @@ class FeedCommands(commands.Cog):
         FeedError with a message for mods, also when the same blog already
         posts in that channel (sqlite3.IntegrityError if one was added at
         the same moment)."""
+        if author_id and (blog := await self._feed_by_author(str(guild.id), author_id)):
+            raise FeedError(f"<@{author_id}> already has a blog on the feed: feed #{blog['id']} "
+                            f"**{self._name(blog)}**. Each member has one; to swap, remove that feed or "
+                            "clear its author first")
         channel = guild.get_channel(channel_id) if channel_id in FEED_CHANNELS.values() else None
         if not isinstance(channel, discord.TextChannel):
             raise FeedError(f"feed channel {channel_id} doesn't exist anymore; update FEED_CHANNELS in config.py")
@@ -261,6 +265,12 @@ class FeedCommands(commands.Cog):
         return next((f for f in feeds if f["id"] in sharing), None)
 
     @staticmethod
+    async def _feed_by_author(guild_id: str, author_id: str, ignore_feed: int | None = None) -> dict | None:
+        """The feed credited to this member, if any: each member has one blog on the feed."""
+        return next((f for f in await db.get_feeds(guild_id)
+                     if f["author_id"] == author_id and f["id"] != ignore_feed), None)
+
+    @staticmethod
     async def _link_author(feed_id: int, guild_id: str, author_id: str, linked_by: str):
         """Credit a member for a feed, and put them on the RSS watchlist so
         their activity in the server is tracked like any watched member's."""
@@ -298,6 +308,9 @@ class FeedCommands(commands.Cog):
                          "so posts will show the role without pinging anyone.")
         if author:
             notes.append(f"\n👤 Posts credit {author.mention}, who's now on the RSS watchlist.")
+        elif target.id == FEED_COMMUNITY_CHANNEL_ID:
+            notes.append(f"\n👤 No author: posts won't credit anyone and the activity rule doesn't apply. "
+                         f"If a member writes it, add them with `/feed edit feed:{feed_id} author:`.")
         if name and name.strip():
             await db.update_feed(feed_id, str(interaction.guild_id), display_name=name.strip())
         row = await db.get_feed(feed_id, str(interaction.guild_id))
@@ -380,6 +393,12 @@ class FeedCommands(commands.Cog):
         if not await db.get_feed(feed, guild_id):
             await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
             return
+        if author and (blog := await self._feed_by_author(guild_id, str(author.id), ignore_feed=feed)):
+            await interaction.response.send_message(
+                f"{author.mention} already has a blog on the feed: feed #{blog['id']} **{self._name(blog)}**. "
+                f"Each member has one; to swap, clear that feed's author first "
+                f"(`/feed edit feed:{blog['id']} clear:author`).", ephemeral=True)
+            return
         changes = {}
         if channel:
             if int(channel) not in FEED_CHANNELS.values():
@@ -452,20 +471,40 @@ class FeedCommands(commands.Cog):
     # Suggestions: members propose, mods approve with a button
     # ──────────────────────────────────────────
 
-    @blog.command(name="suggest", description="Suggest a blog for the community feed. Mods approve it.")
+    # Members can only suggest members' blogs: every suggestion names the
+    # member who writes it, who's credited on posts and covered by the
+    # activity rule. Feeds without an author are for mods to add (/feed add).
+    @blog.command(name="suggest", description="Suggest a member's blog for the community feed. Mods approve it.")
     @app_commands.describe(url="The blog's RSS or Atom feed URL (often ends in /feed or /rss)",
-                           own_blog="Is this your own blog? Then posts credit you (default: yes)",
+                           author="The member who writes it (default: you)",
                            note="Anything the mods should know")
-    async def feed_suggest(self, interaction: discord.Interaction, url: str, own_blog: bool = True,
+    async def feed_suggest(self, interaction: discord.Interaction, url: str, author: discord.Member | None = None,
                            note: app_commands.Range[str, 1, 300] | None = None):
         await interaction.response.defer(ephemeral=True)
         url = feed_reader.normalize_url(url)
-        guild_id, member_id = str(interaction.guild_id), str(interaction.user.id)
+        author = author or interaction.user
+        guild_id, member_id, author_id = str(interaction.guild_id), str(interaction.user.id), str(author.id)
+        if author.bot:
+            await interaction.followup.send("The author has to be a member who writes the blog, not a bot.",
+                                            ephemeral=True)
+            return
         if duplicate := await self._duplicate_of(guild_id, url, set()):
-            await interaction.followup.send(self._already_tracked(duplicate, member_id, own_blog), ephemeral=True)
+            await interaction.followup.send(self._already_tracked(duplicate, member_id, author_id), ephemeral=True)
+            return
+        yours = author_id == member_id
+        if blog := await self._feed_by_author(guild_id, author_id):
+            has = "You already have" if yours else f"{author.mention} already has"
+            await interaction.followup.send(f"{has} a blog on the feed: **{self._name(blog)}**. Each member "
+                                            "has one; ask a mod if it should be swapped.", ephemeral=True)
+            return
+        pending = await db.pending_suggestions(guild_id)
+        if any(s["author_id"] == author_id for s in pending):
+            whose = "your" if yours else f"{author.mention}'s"
+            await interaction.followup.send(f"There's already a suggestion waiting for {whose} blog; "
+                                            "the mods will look at it soon.", ephemeral=True)
             return
         same_url = feed_reader.comparable_url(url)
-        if any(feed_reader.comparable_url(s["url"]) == same_url for s in await db.pending_suggestions(guild_id)):
+        if any(feed_reader.comparable_url(s["url"]) == same_url for s in pending):
             await interaction.followup.send("Someone already suggested that feed; the mods will look at it soon.",
                                             ephemeral=True)
             return
@@ -484,10 +523,10 @@ class FeedCommands(commands.Cog):
                 return
         # The same blog at another address (/feed and /rss, say) has the same posts.
         if duplicate := await self._duplicate_of(guild_id, url, feed_reader.item_ids(items)):
-            await interaction.followup.send(self._already_tracked(duplicate, member_id, own_blog), ephemeral=True)
+            await interaction.followup.send(self._already_tracked(duplicate, member_id, author_id), ephemeral=True)
             return
 
-        suggestion_id = await db.add_suggestion(guild_id, url, title, member_id, own_blog, note)
+        suggestion_id = await db.add_suggestion(guild_id, url, title, member_id, author_id, note)
         cards = self.bot.get_channel(FEED_SUGGESTIONS_CHANNEL_ID)
         if cards is None:
             logger.error("Feed suggestions channel %s not found; suggestion #%s is only in the database",
@@ -501,10 +540,11 @@ class FeedCommands(commands.Cog):
                 embed.add_field(name="Latest post", value=f"[{discord.utils.escape_markdown(newest[0].title)[:200]}]"
                                                           f"(<{feed_reader.clean_url(newest[0].link)}>)"[:1024],
                                 inline=False)
-            joined = interaction.user.joined_at
-            embed.add_field(name="Suggested by",
-                            value=f"{interaction.user.mention} ({'their own blog' if own_blog else 'not their blog'})"
-                                  + (f", member since <t:{int(joined.timestamp())}:R>" if joined else ""),
+            joined = author.joined_at
+            embed.add_field(name="Author",
+                            value=author.mention
+                                  + (f", member since <t:{int(joined.timestamp())}:R>" if joined else "")
+                                  + ("" if author == interaction.user else f"\nSuggested by {interaction.user.mention}"),
                             inline=False)
             if note:
                 embed.add_field(name="Note", value=note, inline=False)
@@ -520,13 +560,14 @@ class FeedCommands(commands.Cog):
             "I'll DM you when they've decided.", ephemeral=True)
         logger.info("Feed suggestion #%s by %s: %s", suggestion_id, interaction.user, url)
 
-    def _already_tracked(self, feed: dict, member_id: str, own_blog: bool) -> str:
+    def _already_tracked(self, feed: dict, member_id: str, author_id: str) -> str:
         """The answer to suggesting a blog that's already on the feed."""
         text = f"That blog is already on the feed as **{self._name(feed)}**. 🎉"
-        if feed["author_id"] == member_id:
-            return text + " Its posts credit you."
-        if own_blog and not feed["author_id"]:
-            return text + " If it's yours, ask a mod to credit you on its posts."
+        who = "you" if author_id == member_id else f"<@{author_id}>"
+        if feed["author_id"] == author_id:
+            return text + f" Its posts credit {who}."
+        if not feed["author_id"]:
+            return text + f" Ask a mod to credit {who} on its posts."
         return text
 
     async def approve_suggestion(self, interaction: discord.Interaction, suggestion_id: int):
@@ -535,7 +576,7 @@ class FeedCommands(commands.Cog):
             await interaction.followup.send("Another mod already decided on this one.", ephemeral=True)
             return
         suggestion = await db.get_suggestion(suggestion_id)
-        author_id = suggestion["suggested_by"] if suggestion["own_blog"] else None
+        author_id = suggestion["author_id"]
         try:
             feed_id, title, items, channel = await self._create_feed(
                 interaction.guild, suggestion["url"], DEFAULT_CHANNEL_ID, None, author_id, str(interaction.user.id))
@@ -552,10 +593,16 @@ class FeedCommands(commands.Cog):
             await self._post(channel, row, feed_name(row, title), newest, ping=False)
         await self._close_card(interaction.message, discord.Color.green(),
                                f"✅ Approved by {interaction.user.mention}: feed #{feed_id} → {channel.mention}{credit}")
-        await self._dm(suggestion["suggested_by"],
-                       f"🎉 Your suggestion **{discord.utils.escape_markdown(title or suggestion['url'])}** was "
-                       f"approved! New posts will appear in {channel.mention}"
-                       + (", with a shout-out to you." if author_id else "."))
+        blog = discord.utils.escape_markdown(title or suggestion["url"])
+        suggested_by = suggestion["suggested_by"]
+        shout_out = {None: ".", suggested_by: ", with a shout-out to you."}.get(author_id, f", crediting <@{author_id}>.")
+        await self._dm(suggested_by,
+                       f"🎉 Your suggestion **{blog}** was approved! New posts will appear in {channel.mention}"
+                       + shout_out)
+        if author_id and author_id != suggested_by:  # someone suggested their blog: tell them too
+            await self._dm(author_id, f"🎉 Your blog **{blog}** is now on the community feed, suggested by "
+                                      f"<@{suggested_by}>. New posts will appear in {channel.mention}, "
+                                      "with a shout-out to you.")
         logger.info("Feed suggestion #%s approved by %s as feed #%s", suggestion_id, interaction.user, feed_id)
         await db.add_audit_log(action="feed_suggestion_approved", actor_id=str(interaction.user.id),
                                target_id=suggestion["suggested_by"],

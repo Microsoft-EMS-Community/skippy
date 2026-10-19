@@ -139,6 +139,11 @@ async def init_db():
             "activity_exempt": "INTEGER NOT NULL DEFAULT 0",
             "display_name": "TEXT",
         })
+        # Suggestions name the blog's author; older ones only said whether
+        # it was the suggester's own blog.
+        await _add_missing_columns(db, "feed_suggestions", {"author_id": "TEXT"})
+        await db.execute("UPDATE feed_suggestions SET author_id = suggested_by "
+                         "WHERE author_id IS NULL AND own_blog = 1")
         await db.commit()
 
 
@@ -757,12 +762,12 @@ async def feed_item_ids(feed_id: int) -> set[str]:
 # ──────────────────────────────────────────────
 
 async def add_suggestion(guild_id: str, url: str, title: str, suggested_by: str,
-                         own_blog: bool, note: str | None) -> int:
+                         author_id: str, note: str | None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO feed_suggestions (guild_id, url, title, suggested_by, own_blog, note)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (guild_id, url, title, suggested_by, int(own_blog), note)
+            """INSERT INTO feed_suggestions (guild_id, url, title, suggested_by, author_id, own_blog, note)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (guild_id, url, title, suggested_by, author_id, int(author_id == suggested_by), note)
         )
         await db.commit()
         return cursor.lastrowid
