@@ -1,6 +1,6 @@
 # Run from the repo root: venv/bin/python -m unittest discover -s tests -v
-# /help lists the commands each member can use: everyone sees /blog and the
-# community feed; moderators also see the /feed commands.
+# /help depends only on who asks, never on the channel: moderators get the
+# guide to everything Skippy does, everyone else the same command overview.
 
 import os
 import sys
@@ -15,38 +15,94 @@ os.environ.setdefault("SKIPPY_DB_PATH", os.path.join(tempfile.gettempdir(), "ski
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import commands  # noqa: E402
 
+HELP = commands.FollowUpCommands.help
+HELPER_ONLY = next(r for r in commands.HELPER_ROLE_IDS if r != commands.RSS_ADMIN_ROLE_ID)
 
-async def help_for(roles):
+
+def interaction_with(roles, channel_id=1):
     interaction = mock.Mock()
     interaction.user.roles = [mock.Mock(id=r) for r in roles]
+    interaction.channel = interaction.channel_id = mock.Mock(id=channel_id)
     interaction.response.send_message = mock.AsyncMock()
+    return interaction
+
+
+async def help_for(roles, channel_id=1):
+    interaction = interaction_with(roles, channel_id)
     cog = commands.FollowUpCommands.__new__(commands.FollowUpCommands)
-    await commands.FollowUpCommands.help.callback(cog, interaction)
+    await HELP.callback(cog, interaction)
     return interaction.response.send_message.await_args.kwargs["embed"]
 
 
+async def passes_checks(command, roles):
+    return all([await check(interaction_with(roles)) for check in command.checks])
+
+
+def text(embed):
+    return " ".join(f.value for f in embed.fields)
+
+
 class HelpTests(unittest.IsolatedAsyncioTestCase):
-    async def test_members_see_blog_and_community_feed(self):
-        embed = await help_for([])
-        names = [f.name for f in embed.fields]
-        self.assertIn("Community feed", names)
-        self.assertNotIn("Moderators: feeds", names)
-        self.assertIn("/blog suggest", embed.fields[0].value)
-        self.assertIn("/blog search", embed.fields[0].value)
-        feed = next(f for f in embed.fields if f.name == "Community feed")
-        self.assertIn(f"<#{commands.FEED_COMMUNITY_CHANNEL_ID}>", feed.value)
-        self.assertIn(f"roundup in <#{commands.FEED_ROUNDUP_CHANNEL_ID}>", feed.value)
+    async def test_everyone_can_use_it_in_every_channel(self):
+        self.assertIsNone(HELP.default_permissions)  # not hidden anywhere
+        self.assertEqual(HELP.checks, [])
 
-    async def test_moderators_also_see_feed_commands(self):
-        embed = await help_for([commands.RSS_ADMIN_ROLE_ID])
-        mod = next(f for f in embed.fields if f.name == "Moderators: feeds")
-        for command in ("/feed add", "/feed edit", "/feed activity", "/feed roundup", "/rsswatch"):
-            self.assertIn(command, mod.value)
+    async def test_moderators_get_the_guide_everyone_else_the_overview(self):
+        self.assertIn("Moderator guide", (await help_for([commands.RSS_ADMIN_ROLE_ID])).title)
+        for roles in ([], [HELPER_ONLY]):
+            self.assertEqual((await help_for(roles)).to_dict(), commands.member_help().to_dict())
 
-    async def test_fields_fit_discord_limits(self):
-        embed = await help_for([commands.RSS_ADMIN_ROLE_ID])
-        self.assertTrue(all(len(f.value) <= 1024 for f in embed.fields))
-        self.assertLessEqual(len(embed), 6000)
+    async def test_the_same_in_every_channel(self):
+        for roles in ([], [commands.RSS_ADMIN_ROLE_ID]):
+            here, there = await help_for(roles, channel_id=111), await help_for(roles, channel_id=222)
+            self.assertEqual(here.to_dict(), there.to_dict())
+
+    async def test_overview_has_member_commands_not_mod_ones(self):
+        overview = text(commands.member_help())
+        for command in ("/score", "/stats", "/blog suggest", "/blog search", "/flag", "/unmark"):
+            self.assertIn(f"`{command}", overview)
+        self.assertNotIn("/feed", overview)
+        self.assertNotIn("/rsswatch", overview)
+        self.assertIn(f"roundup in <#{commands.FEED_ROUNDUP_CHANNEL_ID}>", overview)
+
+    async def test_guide_covers_every_area(self):
+        guide = commands.moderator_help()
+        names = " ".join(f.name for f in guide.fields)
+        for area in ("Follow-ups", "Feeds", "Blog", "RSS watchlist", "New accounts", "Links", "Fun",
+                     "Where Skippy reports", "Changing Skippy"):
+            self.assertIn(area, names)
+        for channel in (commands.FEED_ROUNDUP_CHANNEL_ID, commands.RSS_AUDIT_CHANNEL_ID,
+                        commands.HELPER_LOG_CHANNEL_ID):
+            self.assertIn(f"<#{channel}>", text(guide))
+
+    async def test_guide_lists_every_slash_command_the_bot_has(self):
+        import feeds
+        groups = {"rsswatch": commands.RssWatchCommands.rsswatch, "feed": feeds.FeedCommands.feed,
+                  "blog": feeds.FeedCommands.blog}
+        names = [c.name for c in commands.FollowUpCommands.__cog_app_commands__ if c.name != "help"]
+        names += [f"{g} {c.name}" for g, group in groups.items() for c in group.commands]
+        self.assertGreater(len(names), 20)
+        guide = text(commands.moderator_help())
+        self.assertEqual([n for n in names if f"`/{n}" not in guide], [])
+
+    async def test_both_fit_discord_limits(self):
+        for embed in (commands.member_help(), commands.moderator_help()):
+            self.assertTrue(all(len(f.value) <= 1024 for f in embed.fields))
+            self.assertLessEqual(len(embed), 6000)
+
+    async def test_audit_is_for_helpers(self):
+        audit = commands.FollowUpCommands.audit
+        self.assertFalse(await passes_checks(audit, []))
+        self.assertTrue(await passes_checks(audit, [commands.HELPER_ROLE_IDS[0]]))
+
+    async def test_a_refused_command_says_why(self):
+        interaction = interaction_with([])
+        interaction.response.is_done = mock.Mock(return_value=False)
+        cog = commands.FollowUpCommands.__new__(commands.FollowUpCommands)
+        await cog.cog_app_command_error(interaction, commands.app_commands.CheckFailure())
+        args, kwargs = interaction.response.send_message.await_args
+        self.assertIn("helpers and moderators", args[0])
+        self.assertTrue(kwargs["ephemeral"])
 
 
 if __name__ == "__main__":

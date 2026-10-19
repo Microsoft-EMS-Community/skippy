@@ -22,7 +22,7 @@ skippy/
 ├── bot.py           # Main bot entry point (events, on_member_update, on_message)
 ├── db.py            # Async SQLite layer (aiosqlite)
 ├── config.py        # All configuration (tokens, IDs, DB path)
-├── commands.py      # Slash commands (/unmark /score /audit)
+├── commands.py      # Slash commands (/flag /unmark /score /audit /help ...)
 ├── tasks.py         # Background 24h loop (48h warning, 7d ignored)
 ├── feeds.py         # /feed commands + loop posting new RSS/Atom items
 ├── feed_reader.py   # Fetching and parsing RSS/Atom feeds
@@ -178,7 +178,8 @@ When a member with 🔴 role posts in any non-bot channel:
 | `/flag @user [reason]` | Helpers only | Flag a user with 🔴, log context, ping them |
 | `/unmark @user` | Helpers only | Remove 🔴 role, resolve all open follow-ups, log action |
 | `/score @user` | Anyone | Show flag_count, resolved_count, open_count, avg resolution time |
-| `/audit` | Anyone | Show last 10 audit log entries |
+| `/audit` | Helpers only | Show last 10 audit log entries |
+| `/help` | Anyone | Moderators get a guide to everything Skippy does; everyone else the same command overview. It never depends on the channel |
 | `/feed add <url> [channel] [role] [author] [name]` | RSS admins | Post a feed's new items in one of the feed channels, optionally pinging a role; its newest item is posted right away (no pings) as a sign it's connected |
 | `/feed remove <feed>` | RSS admins | Stop posting a feed |
 | `/feed list` | RSS admins | Show all feeds and whether they're working |
