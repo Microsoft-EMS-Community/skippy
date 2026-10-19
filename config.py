@@ -76,7 +76,7 @@ FEED_LINK_EMOJIS = {
     "linkedin": "<:linkedin:1561701870211436554>",
     "x": "<:x_:1561698449114800208>",
     "youtube": "<:youtube:1561700836634263572>",
-    "github": "<:tool_github:1031898235167576094>",
+    "github": "<:github:1561705127776231495>",
 }
 
 # New Account heuristic tagging
