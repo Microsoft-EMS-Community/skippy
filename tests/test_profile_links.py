@@ -44,11 +44,18 @@ class NormalizeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"an X profile; use x.com/yourhandle or @yourhandle"):
             normalize("x", "https://x.com/home")
 
-    def test_line_in_a_fixed_order_without_preview_cards(self):
-        links = {"github": "https://github.com/a", "linkedin": "https://www.linkedin.com/in/a"}
-        self.assertEqual(profile_links.line(links, {"linkedin": "💼"}),
-                         "[💼](<https://www.linkedin.com/in/a>) [🔗](<https://github.com/a>)")
+    def test_line_is_icon_and_handle_in_a_fixed_order_without_preview_cards(self):
+        links = {"github": "https://github.com/a", "x": "https://x.com/jonas_b",
+                 "linkedin": "https://www.linkedin.com/in/jonas-b"}
+        self.assertEqual(profile_links.line(links, {"linkedin": "<:linkedin:1>", "x": "<:x_:2>"}),
+                         "<:linkedin:1> [jonas-b](<https://www.linkedin.com/in/jonas-b>)  "
+                         "<:x_:2> [@jonas\\_b](<https://x.com/jonas_b>)  🔗 [a](<https://github.com/a>)")
         self.assertEqual(profile_links.line({}, {}), "")
+
+    def test_handles_shown(self):
+        self.assertEqual(profile_links.handle("https://www.youtube.com/@sky.made-simple"), "@sky.made-simple")
+        self.assertEqual(profile_links.handle("https://www.youtube.com/channel/UC1234567890123456789012"), "channel")
+        self.assertEqual(profile_links.handle("https://x.com/jonasb"), "@jonasb")
 
 
 if __name__ == "__main__":

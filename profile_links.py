@@ -69,9 +69,29 @@ def normalize(site: str, raw: str) -> str:
 
 
 def line(links: dict[str, str], emojis: dict[str, str]) -> str:
-    """The line under a post: each site's icon, clickable, linking to the
-    profile without adding its own preview card. Empty when there are no links."""
-    return " ".join(f"[{emojis.get(site, '🔗')}](<{links[site]}>)" for site in SITES if links.get(site))
+    """The line under a post: each site's icon followed by the handle,
+    linking to the profile without adding its own preview card. (Discord
+    doesn't make server emojis clickable in messages, so the handle is the
+    link.) Empty when there are no links."""
+    return "  ".join(f"{emojis.get(site, '🔗')} [{_escape(handle(links[site]))}](<{links[site]}>)"
+                     for site in SITES if links.get(site))
+
+
+def handle(url: str) -> str:
+    """How a profile is shown: @name on X and YouTube, the name on LinkedIn
+    and GitHub, "channel" for a YouTube channel without a handle."""
+    parts = urlsplit(url)
+    name = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    if parts.hostname == "x.com":
+        return "@" + name
+    if parts.path.startswith("/channel/"):
+        return "channel"
+    return name
+
+
+def _escape(text: str) -> str:
+    """Handles can hold _ (X), which Discord would read as italics."""
+    return re.sub(r"([_*~`|\\])", r"\\\1", text)
 
 
 def _wrong(site: str) -> str:
