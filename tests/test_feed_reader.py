@@ -2,6 +2,7 @@
 # No test touches the internet: fetching runs against a local test server.
 
 import email.utils
+import ssl
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -110,6 +111,13 @@ class ParseTests(unittest.TestCase):
         self.assertEqual((video.writer, video.image), ("Some Channel", "https://i.ytimg.com/vi/abc/hqdefault.jpg"))
         self.assertEqual((hugo.writer, hugo.image), ("", ""))
         self.assertIn("summary", hugo.summary)
+
+    def test_links_without_the_sites_address_are_completed(self):
+        hugo = (b"<rss><channel><title>Hugo</title><link>/</link><item><title>Post</title>"
+                b"<link>/2026/10/13/post/</link><guid>/2026/10/13/post/</guid></item></channel></rss>")
+        _, items = parse_feed(hugo, "https://svrooij.io/index.xml")
+        self.assertEqual([i.link for i in items], ["https://svrooij.io/2026/10/13/post/"])
+        self.assertEqual(parse_feed(hugo)[1], [])  # with nothing to read it against, it's no link
 
     def test_rss1_rdf(self):
         title, items = parse_feed(RDF)
@@ -299,6 +307,10 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await feed_reader.fetch_preview(self.http, self.url("/bare")), PagePreview())
         for path in ("/broken", "/evil", "/slow-down"):  # the card just uses the feed's own
             self.assertEqual(await feed_reader.fetch_preview(self.http, self.url(path)), PagePreview())
+
+    async def test_tls_checks_certificates_without_aiohttps_http11_only_signal(self):
+        self.assertIs(self.http.connector._ssl, feed_reader._TLS)
+        self.assertEqual((feed_reader._TLS.verify_mode, feed_reader._TLS.check_hostname), (ssl.CERT_REQUIRED, True))
 
     def test_retry_after_is_kept_between_a_minute_and_six_hours(self):
         self.assertEqual(feed_reader._retry_after_seconds("5"), 60)

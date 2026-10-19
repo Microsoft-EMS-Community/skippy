@@ -135,6 +135,11 @@ class FeedPollTests(FeedTestCase):
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])  # nothing posts twice
 
+    async def test_links_without_the_sites_address_still_post(self):
+        hugo = b"<rss><channel><title>Blog</title><item><title>Post r</title><link>/2026/r/</link></item></channel></rss>"
+        await self.check(FetchResult(hugo, None, None))
+        self.assertEqual(self.channel.sent[0][0].url, "https://example.com/2026/r/")  # read against the feed's address
+
     async def test_burst_becomes_one_summary_with_nothing_dropped(self):
         keys = [f"n{i}" for i in range(8, 0, -1)]  # n8 newest ... n1 oldest
         await self.check(rss(*keys))

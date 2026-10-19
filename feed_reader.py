@@ -6,6 +6,7 @@
 import email.utils
 import html
 import re
+import ssl
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -74,10 +75,18 @@ class FetchResult:
     last_modified: str | None
 
 
+# Python's standard TLS settings (certificates checked as usual), not
+# aiohttp's own: aiohttp announces it only speaks HTTP/1.1 (ALPN), which
+# WordPress.com's bot check treats as a bot and answers with a "Checking your
+# browser" page, so blogs hosted there (EMS Route, Intune IRL, ...) couldn't
+# be read.
+_TLS = ssl.create_default_context()
+
+
 def session() -> aiohttp.ClientSession:
     """HTTP session whose connections can only reach public addresses
     (same DNS-rebinding-safe resolver as link_cleaner)."""
-    connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver())
+    connector = aiohttp.TCPConnector(resolver=_PublicOnlyResolver(), ssl=_TLS)
     return aiohttp.ClientSession(connector=connector, headers={"User-Agent": USER_AGENT})
 
 
@@ -206,8 +215,10 @@ def item_ids(items: list[FeedItem]) -> set[str]:
     return {i.key for i in items} | {i.link for i in items} | {clean_url(i.link) for i in items}
 
 
-def parse_feed(data: bytes) -> tuple[str, list[FeedItem]]:
-    """Return (feed title, items in document order) for RSS 2.0, RSS 1.0 or Atom."""
+def parse_feed(data: bytes, base_url: str = "") -> tuple[str, list[FeedItem]]:
+    """Return (feed title, items in document order) for RSS 2.0, RSS 1.0 or
+    Atom. Links written without the site's address ("/2026/10/post/", as
+    some Hugo sites do) are read against base_url, the feed's own address."""
     # Real feeds never declare entities; refusing them rules out entity
     # expansion tricks outright (expat also caps them).
     if b"<!ENTITY" in data:
@@ -224,14 +235,14 @@ def parse_feed(data: bytes) -> tuple[str, list[FeedItem]]:
         if channel is None:
             raise FeedError("RSS feed has no <channel>")
         title = _text(channel.find("title"))
-        items = [_rss_item(el) for el in channel.findall("item")]
+        items = [_rss_item(el, base_url) for el in channel.findall("item")]
     elif root.tag == ATOM + "feed":
         title = _text(root.find(ATOM + "title"))
-        items = [_atom_entry(el) for el in root.findall(ATOM + "entry")]
+        items = [_atom_entry(el, base_url) for el in root.findall(ATOM + "entry")]
     elif root.tag == RDF + "RDF":
         channel = root.find(RSS1 + "channel")
         title = _text(channel.find(RSS1 + "title")) if channel is not None else ""
-        items = [_rdf_item(el) for el in root.findall(RSS1 + "item")]
+        items = [_rdf_item(el, base_url) for el in root.findall(RSS1 + "item")]
     else:
         raise FeedError("that's not an RSS or Atom feed")
 
@@ -364,7 +375,9 @@ def _date(value: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _item(key: str, title: str, link: str, published: str, **card) -> FeedItem | None:
+def _item(key: str, title: str, link: str, published: str, base: str, **card) -> FeedItem | None:
+    if base and link and not link.startswith(("http://", "https://")):
+        link = urljoin(base, link)
     if not link.startswith(("http://", "https://")):
         return None
     if card.get("image"):
@@ -372,7 +385,7 @@ def _item(key: str, title: str, link: str, published: str, **card) -> FeedItem |
     return FeedItem(key or link, title, link, _date(published), **card)
 
 
-def _rss_item(el) -> FeedItem | None:
+def _rss_item(el, base: str) -> FeedItem | None:
     link = _text(el.find("link"))
     guid = _text(el.find("guid"))
     if not link and guid.startswith(("http://", "https://")):
@@ -380,25 +393,25 @@ def _rss_item(el) -> FeedItem | None:
     # <author> is an e-mail address, with the name in brackets if at all.
     named = re.search(r"\(([^)]+)\)", _text(el.find("author")))
     return _item(guid, _text(el.find("title")), link, _text(el.find("pubDate")) or _text(el.find(DC + "date")),
-                 summary=_text(el.find("description")), content=_text(el.find(CONTENT + "encoded")),
+                 base, summary=_text(el.find("description")), content=_text(el.find(CONTENT + "encoded")),
                  image=_media_image(el), writer=_text(el.find(DC + "creator")) or (named.group(1) if named else ""))
 
 
-def _atom_entry(el) -> FeedItem | None:
+def _atom_entry(el, base: str) -> FeedItem | None:
     link = ""
     for candidate in el.findall(ATOM + "link"):
         if candidate.get("rel", "alternate") == "alternate" and candidate.get("href"):
             link = candidate.get("href")
             break
     published = _text(el.find(ATOM + "published")) or _text(el.find(ATOM + "updated"))
-    return _item(_text(el.find(ATOM + "id")), _text(el.find(ATOM + "title")), link, published,
+    return _item(_text(el.find(ATOM + "id")), _text(el.find(ATOM + "title")), link, published, base,
                  summary=_text(el.find(ATOM + "summary")), content=_text(el.find(ATOM + "content")),
                  image=_media_image(el), writer=_text(el.find(f"{ATOM}author/{ATOM}name")))
 
 
-def _rdf_item(el) -> FeedItem | None:
+def _rdf_item(el, base: str) -> FeedItem | None:
     link = _text(el.find(RSS1 + "link"))
-    return _item(el.get(RDF + "about", ""), _text(el.find(RSS1 + "title")), link, _text(el.find(DC + "date")),
+    return _item(el.get(RDF + "about", ""), _text(el.find(RSS1 + "title")), link, _text(el.find(DC + "date")), base,
                  summary=_text(el.find(RSS1 + "description")), writer=_text(el.find(DC + "creator")))
 
 
