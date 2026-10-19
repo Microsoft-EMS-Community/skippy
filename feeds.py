@@ -472,17 +472,17 @@ class FeedCommands(commands.Cog):
     # ──────────────────────────────────────────
 
     # Members can only suggest members' blogs: every suggestion names the
-    # member who writes it, who's credited on posts and covered by the
-    # activity rule. Feeds without an author are for mods to add (/feed add).
+    # member who writes it (a required choice, even when it's the suggester),
+    # who's credited on posts and covered by the activity rule. Feeds without
+    # an author are for mods to add (/feed add).
     @blog.command(name="suggest", description="Suggest a member's blog for the community feed. Mods approve it.")
     @app_commands.describe(url="The blog's RSS or Atom feed URL (often ends in /feed or /rss)",
-                           author="The member who writes it (default: you)",
+                           author="The member who writes it: pick yourself if it's your blog",
                            note="Anything the mods should know")
-    async def feed_suggest(self, interaction: discord.Interaction, url: str, author: discord.Member | None = None,
+    async def feed_suggest(self, interaction: discord.Interaction, url: str, author: discord.Member,
                            note: app_commands.Range[str, 1, 300] | None = None):
         await interaction.response.defer(ephemeral=True)
         url = feed_reader.normalize_url(url)
-        author = author or interaction.user
         guild_id, member_id, author_id = str(interaction.guild_id), str(interaction.user.id), str(author.id)
         if author.bot:
             await interaction.followup.send("The author has to be a member who writes the blog, not a bot.",

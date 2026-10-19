@@ -545,9 +545,10 @@ class FeedCommandTestCase(FeedTestCase):
         return i.followup.send.await_args.args[0]
 
     async def suggest(self, url, result=None, author=None, user_id="300"):
+        """A suggestion by member user_id, who picks author (themselves unless given)."""
         i = self.guild_interaction(user_id)
         with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=result or rss("x"))):
-            await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, author)
+            await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, author or i.user)
         return i.followup.send.await_args.args[0]
 
 
@@ -608,8 +609,9 @@ class AuthorTests(FeedCommandTestCase):
         await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
 
     async def test_a_suggestion_always_names_an_author(self):
-        await self.suggest("https://mine.example/feed")                          # your own blog by default
-        await self.suggest("https://theirs.example/feed", author=member(301))    # or another member's
+        self.assertTrue(feeds.FeedCommands.feed_suggest.get_parameter("author").required)  # even if it's you
+        await self.suggest("https://mine.example/feed")                          # picking themselves
+        await self.suggest("https://theirs.example/feed", author=member(301))    # or another member
         authors = [(s["suggested_by"], s["author_id"]) for s in await db.pending_suggestions("1")]
         self.assertEqual(authors, [("300", "300"), ("300", "301")])
         card = self.alerts.embeds[-1].fields
