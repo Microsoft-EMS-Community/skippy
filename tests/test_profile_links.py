@@ -56,6 +56,7 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(profile_links.handle("https://www.youtube.com/@sky.made-simple"), "@sky.made-simple")
         self.assertEqual(profile_links.handle("https://www.youtube.com/channel/UC1234567890123456789012"), "channel")
         self.assertEqual(profile_links.handle("https://x.com/jonasb"), "@jonasb")
+        self.assertEqual(profile_links.handle("https://www.linkedin.com/in/jo%C3%ABl-prins"), "joël-prins")
 
 
 if __name__ == "__main__":
