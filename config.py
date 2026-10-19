@@ -70,6 +70,14 @@ FEED_ROUNDUP_TIMEZONE = "Europe/Copenhagen"                 # The roundup goes o
 # Added to every post in the community channel; the roundup's top 3 are the
 # posts with the most of these. The server's own :msems: emoji ("<:name:id>" format).
 FEED_VOTE_EMOJI = "<:msems:1368551524963192842>"
+# In front of an author's profile links under their posts (server emojis in
+# "<:name:id>" format). Swap these if the server gets its own logos.
+FEED_LINK_EMOJIS = {
+    "linkedin": "💼",
+    "x": "<:x_:1561698449114800208>",
+    "youtube": "▶️",
+    "github": "<:tool_github:1031898235167576094>",
+}
 
 # New Account heuristic tagging
 NEW_ACCOUNT_ROLE_ID = 1534323968591532083   # 🆕 auto-assigned on join if heuristics trip

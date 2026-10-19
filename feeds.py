@@ -4,6 +4,7 @@
 # ============================================================
 
 import asyncio
+import json
 import logging
 from collections import Counter
 import sqlite3
@@ -18,10 +19,11 @@ from discord.ext import commands, tasks
 
 import db
 import feed_reader
+import profile_links
 from commands import is_rss_admin
 from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_COMMUNITY_CHANNEL_ID, FEED_POLL_MINUTES,
                     FEED_ROUNDUP_CHANNEL_ID, FEED_ROUNDUP_TIMEZONE, FEED_SUGGESTIONS_CHANNEL_ID,
-                    FEED_THREAD_CHANNEL_IDS, FEED_VOTE_EMOJI, RSS_ADMIN_ROLE_ID)
+                    FEED_LINK_EMOJIS, FEED_THREAD_CHANNEL_IDS, FEED_VOTE_EMOJI, RSS_ADMIN_ROLE_ID)
 from feed_reader import FeedError, RateLimited
 
 logger = logging.getLogger("followup-bot")
@@ -114,6 +116,12 @@ def build_roundup(posts: list[dict], now: datetime, votes: dict[str, int] | None
 # Values are strings because channel IDs are too big for Discord's integers.
 CHANNEL_CHOICES = [app_commands.Choice(name=name, value=str(cid)) for name, cid in FEED_CHANNELS.items()]
 DEFAULT_CHANNEL_ID = next(iter(FEED_CHANNELS.values()))
+# The author's profile links, as options on /feed add, /feed edit, /blog suggest and /blog links.
+LINK_OPTIONS = {site: f"{label} profile, like {profile_links.EXAMPLES[site]}"
+                for site, label in profile_links.SITES.items()}
+LINK_CHOICES = ([app_commands.Choice(name=label, value=site) for site, label in profile_links.SITES.items()]
+                + [app_commands.Choice(name="all of them", value="all")])
+
 CLEARABLE_SETTINGS = [
     app_commands.Choice(name="role ping", value="role_id"),
     app_commands.Choice(name="author", value="author_id"),
@@ -121,7 +129,13 @@ CLEARABLE_SETTINGS = [
     app_commands.Choice(name="include words", value="include_words"),
     app_commands.Choice(name="exclude words", value="exclude_words"),
     app_commands.Choice(name="highlight words", value="highlight_words"),
-]
+] + [app_commands.Choice(name=f"{label} link", value=f"link:{site}") for site, label in profile_links.SITES.items()]
+
+
+def read_links(**given: str | None) -> dict[str, str]:
+    """Profile links given as command options (None when left out), checked
+    and in their standard form. Raises ValueError with a message for the member."""
+    return {site: profile_links.normalize(site, value) for site, value in given.items() if value}
 
 
 def feed_name(feed: dict, fresh_title: str | None = None) -> str:
@@ -285,14 +299,25 @@ class FeedCommands(commands.Cog):
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
                            role="Optional role to ping with every post",
                            author="The member who writes it: credited and pinged on posts, and activity-tracked",
-                           name="What posts call it, if the feed's own title isn't good (e.g. just \"Blog\")")
+                           name="What posts call it, if the feed's own title isn't good (e.g. just \"Blog\")",
+                           **LINK_OPTIONS)
     @app_commands.choices(channel=CHANNEL_CHOICES)
     @is_rss_admin()
     async def feed_add(self, interaction: discord.Interaction, url: str, channel: str | None = None,
                        role: discord.Role | None = None, author: discord.Member | None = None,
-                       name: app_commands.Range[str, 1, 80] | None = None):
+                       name: app_commands.Range[str, 1, 80] | None = None, linkedin: str | None = None,
+                       x: str | None = None, youtube: str | None = None, github: str | None = None):
         await interaction.response.defer(ephemeral=True)
         url = feed_reader.normalize_url(url)
+        try:
+            links = read_links(linkedin=linkedin, x=x, youtube=youtube, github=github)
+        except ValueError as e:
+            await interaction.followup.send(f"Couldn't add that feed: {e}.", ephemeral=True)
+            return
+        if links and not author:
+            await interaction.followup.send("Profile links belong to the blog's author; pick the `author` too.",
+                                            ephemeral=True)
+            return
         try:
             feed_id, title, items, target = await self._create_feed(
                 interaction.guild, url, int(channel) if channel else DEFAULT_CHANNEL_ID,
@@ -310,7 +335,10 @@ class FeedCommands(commands.Cog):
                          "so posts will show the role without pinging anyone.")
         if author:
             notes.append(f"\n👤 Posts credit {author.mention}, who's now on the RSS watchlist.")
-        elif target.id == FEED_COMMUNITY_CHANNEL_ID:
+        if links:
+            await db.set_author_links(str(author.id), links)
+            notes.append(f"\n🔗 Posts link to their {', '.join(profile_links.SITES[site] for site in links)}.")
+        if not author and target.id == FEED_COMMUNITY_CHANNEL_ID:
             notes.append(f"\n👤 No author: posts won't credit anyone and the activity rule doesn't apply. "
                          f"If a member writes it, add them with `/feed edit feed:{feed_id} author:`.")
         if name and name.strip():
@@ -341,6 +369,8 @@ class FeedCommands(commands.Cog):
         if not row or not await db.remove_feed(feed, str(interaction.guild_id)):
             await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
             return
+        if row["author_id"]:
+            await db.delete_author_links(row["author_id"])  # they show with that blog's posts only
         await interaction.response.send_message(
             f"🗑️ Removed feed #{feed} **{discord.utils.escape_markdown(feed_name(row))}**.",
             ephemeral=True)
@@ -381,7 +411,8 @@ class FeedCommands(commands.Cog):
         highlight="In summaries, list titles mentioning these first, in bold (comma-separated)",
         summary_after="More new posts than this at once become one summary post (default 5)",
         activity_exempt="Exempt this feed from the activity rule (see /feed activity)",
-        clear="Remove one setting")
+        clear="Remove one setting",
+        **{site: f"The author's {text}" for site, text in LINK_OPTIONS.items()})
     @app_commands.choices(channel=CHANNEL_CHOICES, clear=CLEARABLE_SETTINGS)
     @is_rss_admin()
     async def feed_edit(self, interaction: discord.Interaction, feed: int, channel: str | None = None,
@@ -390,10 +421,27 @@ class FeedCommands(commands.Cog):
                         include: str | None = None, exclude: str | None = None,
                         highlight: str | None = None,
                         summary_after: app_commands.Range[int, 1, 25] | None = None,
-                        activity_exempt: bool | None = None, clear: str | None = None):
+                        activity_exempt: bool | None = None, clear: str | None = None,
+                        linkedin: str | None = None, x: str | None = None, youtube: str | None = None,
+                        github: str | None = None):
         guild_id = str(interaction.guild_id)
-        if not await db.get_feed(feed, guild_id):
+        current = await db.get_feed(feed, guild_id)
+        if not current:
             await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
+            return
+        # Profile links belong to the feed's author, so they need one.
+        try:
+            links = read_links(linkedin=linkedin, x=x, youtube=youtube, github=github)
+        except ValueError as e:
+            await interaction.response.send_message(f"Couldn't change that: {e}.", ephemeral=True)
+            return
+        if clear and clear.startswith("link:"):
+            links[clear.removeprefix("link:")] = None
+            clear = None
+        links_of = str(author.id) if author else current["author_id"]
+        if links and not links_of:
+            await interaction.response.send_message(
+                "Profile links belong to the blog's author, and this feed has none; set `author` too.", ephemeral=True)
             return
         if author and (blog := await self._feed_by_author(guild_id, str(author.id), ignore_feed=feed)):
             await interaction.response.send_message(
@@ -437,14 +485,19 @@ class FeedCommands(commands.Cog):
         if author:
             await self._link_author(feed, guild_id, str(author.id), str(interaction.user.id))
             changes["author_id"] = str(author.id)
+        if links:
+            await db.set_author_links(links_of, links)
+            changes["links"] = links  # for the audit line
         row = await db.get_feed(feed, guild_id)
         verb = "Updated" if changes else "Settings for"
-        await interaction.response.send_message(f"{verb} feed #{feed}:\n{self._describe(row)}", ephemeral=True)
+        shown_links = await db.get_author_links(row["author_id"]) if row["author_id"] else {}
+        await interaction.response.send_message(f"{verb} feed #{feed}:\n{self._describe(row, shown_links)}",
+                                                ephemeral=True)
         if changes:
             labels = {"channel_id": "channel", "role_id": "ping role", "author_id": "author", "display_name": "name",
                       "include_words": "include words", "exclude_words": "exclude words",
                       "highlight_words": "highlight words", "summary_after": "summary threshold",
-                      "activity_exempt": "activity exemption"}
+                      "activity_exempt": "activity exemption", "links": "profile links"}
             await self._audit(interaction, "edit", f"edited feed #{feed} **{self._name(row)}**: "
                               + ", ".join(labels[k] for k in changes))
 
@@ -480,11 +533,18 @@ class FeedCommands(commands.Cog):
     @blog.command(name="suggest", description="Suggest a member's blog for the community feed. Mods approve it.")
     @app_commands.describe(url="The blog's RSS or Atom feed URL (often ends in /feed or /rss)",
                            author="The member who writes it: pick yourself if it's your blog",
-                           note="Anything the mods should know")
+                           note="Anything the mods should know",
+                           **{site: f"Optional: the author's {text}" for site, text in LINK_OPTIONS.items()})
     async def feed_suggest(self, interaction: discord.Interaction, url: str, author: discord.Member,
-                           note: app_commands.Range[str, 1, 300] | None = None):
+                           note: app_commands.Range[str, 1, 300] | None = None, linkedin: str | None = None,
+                           x: str | None = None, youtube: str | None = None, github: str | None = None):
         await interaction.response.defer(ephemeral=True)
         url = feed_reader.normalize_url(url)
+        try:
+            links = read_links(linkedin=linkedin, x=x, youtube=youtube, github=github)
+        except ValueError as e:  # a typo, not a refusal: nothing for the mods
+            await interaction.followup.send(f"Couldn't send that suggestion: {e}.", ephemeral=True)
+            return
         guild_id, member_id, author_id = str(interaction.guild_id), str(interaction.user.id), str(author.id)
         yours = author_id == member_id
         if author.bot:
@@ -536,7 +596,7 @@ class FeedCommands(commands.Cog):
                                self._already_tracked_reason(duplicate))
             return
 
-        suggestion_id = await db.add_suggestion(guild_id, url, title, member_id, author_id, note)
+        suggestion_id = await db.add_suggestion(guild_id, url, title, member_id, author_id, note, links)
         cards = self.bot.get_channel(FEED_SUGGESTIONS_CHANNEL_ID)
         if cards is None:
             logger.error("Feed suggestions channel %s not found; suggestion #%s is only in the database",
@@ -556,6 +616,8 @@ class FeedCommands(commands.Cog):
                                   + (f", member since <t:{int(joined.timestamp())}:R>" if joined else "")
                                   + ("" if author == interaction.user else f"\nSuggested by {interaction.user.mention}"),
                             inline=False)
+            if links:
+                embed.add_field(name="Profile links", value=profile_links.line(links, FEED_LINK_EMOJIS), inline=False)
             if note:
                 embed.add_field(name="Note", value=note, inline=False)
             embed.set_footer(text=f"Approving adds it to #{next(iter(FEED_CHANNELS))}; change it afterwards "
@@ -596,6 +658,40 @@ class FeedCommands(commands.Cog):
         credit = f"credited to <@{feed['author_id']}>" if feed["author_id"] else "no author yet"
         return f"it's already on the feed as feed #{feed['id']} **{self._name(feed)}** ({credit})"
 
+    @blog.command(name="links", description="Show your LinkedIn, X, YouTube or GitHub under your blog's posts.")
+    @app_commands.describe(clear="Remove one of your links", **LINK_OPTIONS)
+    @app_commands.choices(clear=LINK_CHOICES)
+    async def blog_links(self, interaction: discord.Interaction, linkedin: str | None = None,
+                         x: str | None = None, youtube: str | None = None, github: str | None = None,
+                         clear: str | None = None):
+        member_id = str(interaction.user.id)
+        if not await self._feed_by_author(str(interaction.guild_id), member_id):
+            await interaction.response.send_message(
+                f"Your links show under your blog's posts in <#{FEED_COMMUNITY_CHANNEL_ID}>, so you need a blog "
+                "on the feed first. Suggest it with `/blog suggest`; you can add your links there too.",
+                ephemeral=True)
+            return
+        try:
+            links = read_links(linkedin=linkedin, x=x, youtube=youtube, github=github)
+        except ValueError as e:
+            await interaction.response.send_message(f"Couldn't save that: {e}.", ephemeral=True)
+            return
+        if clear:
+            links.update({site: None for site in profile_links.SITES if clear in (site, "all")})
+        if links:
+            await db.set_author_links(member_id, links)
+        line = profile_links.line(await db.get_author_links(member_id), FEED_LINK_EMOJIS)
+        if not links:
+            await interaction.response.send_message(
+                f"Under your posts: {line or 'no links yet'}. Add or change them with the options on this command.",
+                ephemeral=True)
+            return
+        await interaction.response.send_message(f"✅ Saved. Your posts now show: {line or 'no links'}",
+                                                ephemeral=True)
+        changed = ", ".join(f"{profile_links.SITES[site]} " + (f"<{url}>" if url else "removed")
+                            for site, url in links.items())
+        await self._audit(interaction, "links", f"changed their profile links: {changed}")
+
     def _already_tracked(self, feed: dict, member_id: str, author_id: str) -> str:
         """The answer to suggesting a blog that's already on the feed."""
         text = f"That blog is already on the feed as **{self._name(feed)}**. 🎉"
@@ -622,6 +718,8 @@ class FeedCommands(commands.Cog):
             await interaction.followup.send(f"Couldn't add it: {problem}. The suggestion is still open.",
                                             ephemeral=True)
             return
+        if author_id and suggestion["links"]:
+            await db.set_author_links(author_id, json.loads(suggestion["links"]))
         credit = f", credited to <@{author_id}>" if author_id else ""
         newest = feed_reader.select_new(items, set(), 1)
         row = await db.get_feed(feed_id, str(interaction.guild_id))
@@ -1023,8 +1121,9 @@ class FeedCommands(commands.Cog):
                                     feed["id"], len(items), channel, extras)
                     mentions = discord.AllowedMentions.none()  # ping once, not for every part
             else:
+                links_line = await self._links_line(author_id)
                 for item in items:
-                    message = await channel.send(feed_reader.format_post(name, item, role_id, author_id),
+                    message = await channel.send(feed_reader.format_post(name, item, role_id, author_id, links_line),
                                                  allowed_mentions=mentions)
                     posted.add(item.key)
                     archive.append((item, message.jump_url))
@@ -1036,6 +1135,13 @@ class FeedCommands(commands.Cog):
             await db.archive_feed_posts([(feed["id"], name, i.title, feed_reader.clean_url(i.link), url)
                                          for i, url in archive])
         return posted
+
+    @staticmethod
+    async def _links_line(author_id: str | None) -> str | None:
+        """The author's profile links for under their posts, if they have any."""
+        if not author_id:
+            return None
+        return profile_links.line(await db.get_author_links(author_id), FEED_LINK_EMOJIS) or None
 
     async def _finish_post(self, message: discord.Message, title: str, summary: bool = False) -> str:
         """What every post gets, however it was posted: the vote emoji in the
@@ -1079,8 +1185,10 @@ class FeedCommands(commands.Cog):
         await self._alert(f"🛠️ {interaction.user.mention} {text}")
 
     @staticmethod
-    def _describe(feed: dict) -> str:
+    def _describe(feed: dict, links: dict[str, str] | None = None) -> str:
         none = "—"
+        shown = " · ".join(f"[{label}](<{links[site]}>)" for site, label in profile_links.SITES.items()
+                           if (links or {}).get(site))
         role = f"<@&{feed['role_id']}>" if feed["role_id"] else none
         author = f"<@{feed['author_id']}>" if feed["author_id"] else none
         return "\n".join([
@@ -1090,6 +1198,7 @@ class FeedCommands(commands.Cog):
             f"Channel: <#{feed['channel_id']}>",
             f"Ping role: {role}",
             f"Author: {author}",
+            f"Author's profile links: {shown or none}",
             f"Only titles with: {feed['include_words'] or 'anything'}",
             f"Never titles with: {feed['exclude_words'] or none}",
             f"Highlight in summaries: {feed['highlight_words'] or none}",

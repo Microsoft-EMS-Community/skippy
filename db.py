@@ -5,6 +5,7 @@
 
 import aiosqlite
 import datetime
+import json
 from config import DB_PATH
 
 
@@ -127,6 +128,14 @@ async def init_db():
                 state TEXT NOT NULL,
                 changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- Authors' LinkedIn, X, YouTube and GitHub, shown under their posts
+            CREATE TABLE IF NOT EXISTS author_links (
+                author_id TEXT NOT NULL,
+                site TEXT NOT NULL,                       -- linkedin / x / youtube / github
+                url TEXT NOT NULL,
+                PRIMARY KEY (author_id, site)
+            );
         """)
         # Columns added after the feeds table first shipped; add them to
         # databases created before that.
@@ -141,7 +150,7 @@ async def init_db():
         })
         # Suggestions name the blog's author; older ones only said whether
         # it was the suggester's own blog.
-        await _add_missing_columns(db, "feed_suggestions", {"author_id": "TEXT"})
+        await _add_missing_columns(db, "feed_suggestions", {"author_id": "TEXT", "links": "TEXT"})
         await db.execute("UPDATE feed_suggestions SET author_id = suggested_by "
                          "WHERE author_id IS NULL AND own_blog = 1")
         await db.commit()
@@ -758,16 +767,49 @@ async def feed_item_ids(feed_id: int) -> set[str]:
 
 
 # ──────────────────────────────────────────────
+# Authors' profile links
+# ──────────────────────────────────────────────
+
+async def get_author_links(author_id: str) -> dict[str, str]:
+    """An author's profile links, as {site: url}."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT site, url FROM author_links WHERE author_id = ?", (author_id,))
+        return dict(await cursor.fetchall())
+
+
+async def set_author_links(author_id: str, links: dict[str, str | None]):
+    """Save some of an author's links; a None url removes that one."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for site, url in links.items():
+            if url is None:
+                await db.execute("DELETE FROM author_links WHERE author_id = ? AND site = ?", (author_id, site))
+            else:
+                await db.execute(
+                    """INSERT INTO author_links (author_id, site, url) VALUES (?, ?, ?)
+                       ON CONFLICT(author_id, site) DO UPDATE SET url = excluded.url""",
+                    (author_id, site, url))
+        await db.commit()
+
+
+async def delete_author_links(author_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM author_links WHERE author_id = ?", (author_id,))
+        await db.commit()
+
+
+# ──────────────────────────────────────────────
 # Feed suggestions (/feed suggest)
 # ──────────────────────────────────────────────
 
 async def add_suggestion(guild_id: str, url: str, title: str, suggested_by: str,
-                         author_id: str, note: str | None) -> int:
+                         author_id: str, note: str | None, links: dict[str, str] | None = None) -> int:
+    """Queue a suggestion. `links` are the author's profile links, saved when it's approved."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO feed_suggestions (guild_id, url, title, suggested_by, author_id, own_blog, note)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (guild_id, url, title, suggested_by, author_id, int(author_id == suggested_by), note)
+            """INSERT INTO feed_suggestions (guild_id, url, title, suggested_by, author_id, own_blog, note, links)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (guild_id, url, title, suggested_by, author_id, int(author_id == suggested_by), note,
+             json.dumps(links) if links else None)
         )
         await db.commit()
         return cursor.lastrowid

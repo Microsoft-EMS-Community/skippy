@@ -539,19 +539,19 @@ class FeedCommandTestCase(FeedTestCase):
         i.guild.get_channel = channels.get
         return i
 
-    async def add(self, url, result, channel=None, author=None):
+    async def add(self, url, result, channel=None, author=None, **links):
         i = self.guild_interaction()
         with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=result)):
-            await feeds.FeedCommands.feed_add.callback(self.cog, i, url, channel=channel, author=author)
+            await feeds.FeedCommands.feed_add.callback(self.cog, i, url, channel=channel, author=author, **links)
         return i.followup.send.await_args.args[0]
 
-    async def suggest(self, url, result=None, author=None, user_id="300"):
+    async def suggest(self, url, result=None, author=None, user_id="300", **links):
         """A suggestion by member user_id, who picks author (themselves unless given)."""
         i = self.guild_interaction(user_id)
         result = result or rss("x")
         fetch = mock.AsyncMock(side_effect=result) if isinstance(result, Exception) else mock.AsyncMock(return_value=result)
         with mock.patch.object(feed_reader, "fetch_feed", fetch):
-            await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, author or i.user)
+            await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, author or i.user, **links)
         return i.followup.send.await_args.args[0]
 
 
@@ -707,6 +707,71 @@ class RefusalReportTests(FeedCommandTestCase):
     async def test_accepted_suggestions_are_not_reported(self):
         await self.suggest("https://fine.example/feed")
         self.assertEqual(self.reports(), [])
+
+
+class ProfileLinkTests(FeedCommandTestCase):
+    """Authors' LinkedIn, X, YouTube and GitHub under their posts. Feed #1
+    is linked to member 77."""
+
+    LINKEDIN = "https://www.linkedin.com/in/jonas-b"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+
+    async def links_command(self, user_id="77", **options):
+        i = self.guild_interaction(user_id)
+        await feeds.FeedCommands.blog_links.callback(self.cog, i, **options)
+        return i.response.send_message.await_args.args[0]
+
+    async def test_posts_show_the_authors_links_without_extra_previews(self):
+        await db.set_author_links("77", {"linkedin": self.LINKEDIN, "x": "https://x.com/jonasb"})
+        del self.cog._post  # post for real
+        await self.check(rss("c", "a", "b"))
+        content = self.channel.sent[0][0]
+        emoji = feeds.FEED_LINK_EMOJIS
+        self.assertEqual(content.split("\n")[-1], f"{emoji['linkedin']} [LinkedIn](<{self.LINKEDIN}>) · "
+                                                   f"{emoji['x']} [X](<https://x.com/jonasb>)")
+        self.assertIn("\nhttps://example.com/c\n", content)  # the blog's own link still gets the preview card
+
+    async def test_suggestion_carries_links_to_the_card_and_approval_saves_them(self):
+        await self.suggest("https://new.example/feed", user_id="300", linkedin="jonas-b")
+        suggestion = (await db.pending_suggestions("1"))[0]
+        self.assertIn(self.LINKEDIN, self.alerts.embeds[-1].fields[-1].value)
+        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("x"))):
+            await self.cog.approve_suggestion(self.guild_interaction(), suggestion["id"])
+        self.assertEqual(await db.get_author_links("300"), {"linkedin": self.LINKEDIN})
+
+    async def test_a_bad_link_is_a_typo_not_a_refusal(self):
+        message = await self.suggest("https://new.example/feed", user_id="300", x="https://x.com/home")
+        self.assertIn("doesn't look like an X profile", message)
+        self.assertEqual(await db.pending_suggestions("1"), [])
+        self.assertEqual([c for c, _ in self.alerts.sent if c.startswith("🚫")], [])
+
+    async def test_mods_set_links_with_an_author_only(self):
+        self.assertIn("pick the `author` too", await self.add("https://new.example/feed", rss("x"), linkedin="jonas-b"))
+        await self.add("https://new.example/feed", rss("x"), author=member(300), github="JonasBogvad")
+        self.assertEqual(await db.get_author_links("300"), {"github": "https://github.com/JonasBogvad"})
+        i = interaction()
+        await feeds.FeedCommands.feed_edit.callback(self.cog, i, self.feed_id, youtube="@skymadesimple")
+        self.assertIn("[YouTube](<https://www.youtube.com/@skymadesimple>)", i.response.send_message.await_args.args[0])
+        await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id, clear="link:youtube")
+        self.assertEqual(await db.get_author_links("77"), {})
+
+    async def test_authors_manage_their_own_links(self):
+        self.assertIn("need a blog on the feed first", await self.links_command(user_id="300", x="@jonasb"))
+        self.assertEqual(await db.get_author_links("300"), {})
+        self.assertIn("✅ Saved", await self.links_command(x="@jonasb", linkedin="jonas-b"))
+        self.assertEqual(self.alerts.sent[-1][0], "🛠️ <@77> changed their profile links: "
+                                                  f"LinkedIn <{self.LINKEDIN}>, X <https://x.com/jonasb>")
+        self.assertIn("[X](<https://x.com/jonasb>)", await self.links_command())  # no options: shows them
+        await self.links_command(clear="all")
+        self.assertEqual(await db.get_author_links("77"), {})
+
+    async def test_removing_the_blog_removes_its_links(self):
+        await db.set_author_links("77", {"x": "https://x.com/jonasb"})
+        await feeds.FeedCommands.feed_remove.callback(self.cog, interaction(), self.feed_id)
+        self.assertEqual(await db.get_author_links("77"), {})
 
 
 class ConsistentPostsTests(FeedTestCase):

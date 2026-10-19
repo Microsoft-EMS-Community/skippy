@@ -43,6 +43,7 @@ it if you're fine with that. To stop the pings, remove your line in a PR.
 | `tasks.py` | Background jobs: follow-up reminders, monthly cleanup and report |
 | `feeds.py`, `feed_reader.py` | `/feed` and `/blog`, and reading RSS/Atom feeds |
 | `link_cleaner.py` | Stripping tracking junk, checking short links |
+| `profile_links.py` | Checking authors' LinkedIn, X, YouTube and GitHub links |
 | `db.py` | The SQLite database |
 | `config.py` | Channel and role IDs, timings |
 | `tests/` | Unit tests |

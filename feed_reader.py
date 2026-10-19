@@ -197,15 +197,18 @@ def select_new(items: list[FeedItem], seen: set[str], limit: int) -> list[FeedIt
 
 
 def format_post(feed_title: str, item: FeedItem, role_id: str | None = None,
-                author_id: str | None = None) -> str:
+                author_id: str | None = None, links_line: str | None = None) -> str:
     """"Feed name - Post title" with the link below, which Discord turns into
     a preview card. The same plain format MEE6 used, so the channel looks
-    unchanged after the switch, plus a credit for the author's Discord account."""
+    unchanged after the switch, plus a credit for the author's Discord account
+    and, below the link, their profile links (profile_links.line)."""
     title = discord.utils.escape_markdown(_one_line(item.title)[:MAX_TITLE_CHARS] or "New post")
     head = f"{discord.utils.escape_markdown(_one_line(feed_title))} - {title}" if feed_title else title
     if author_id:
         head += f" · by <@{author_id}>"
     text = f"{head}\n{clean_url(item.link)}"
+    if links_line:
+        text += f"\n{links_line}"
     if role_id:
         text = f"<@&{role_id}> {text}"
     return text[:2000]

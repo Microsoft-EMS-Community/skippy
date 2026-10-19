@@ -46,6 +46,7 @@ def member_help() -> discord.Embed:
             "`/slap @user` - Slap someone. In the name of Skippy.\n"
             "`/blog suggest <feed url> <author>` - Suggest a member's blog (yours or someone else's) for the community feed\n"
             "`/blog search <words>` - Search everything the feeds have posted\n"
+            "`/blog links` - Show your LinkedIn, X, YouTube or GitHub under your blog's posts\n"
             "`/help` - This message"
         ),
         inline=False
@@ -138,6 +139,8 @@ def moderator_help() -> discord.Embed:
         value=(
             f"`/blog suggest <url> <author>` (*everyone*) - members' blogs only: they pick the member who "
             f"writes it, even if it's themselves; the card lands in {mod_audit} to approve or reject\n"
+            "`/blog links` (*everyone*) - authors put their LinkedIn, X, YouTube or GitHub under their posts; "
+            "mods can set them with `/feed add` and `/feed edit`\n"
             "`/blog search <words>` (*everyone*) - everything the feeds have posted"
         ),
         inline=False
