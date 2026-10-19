@@ -19,9 +19,9 @@ from discord.ext import commands, tasks
 import db
 import feed_reader
 from commands import is_rss_admin
-from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_POLL_MINUTES, FEED_ROUNDUP_CHANNEL_ID,
-                    FEED_ROUNDUP_TIMEZONE, FEED_SUGGESTIONS_CHANNEL_ID, FEED_THREAD_CHANNEL_IDS,
-                    FEED_VOTE_EMOJI, RSS_ADMIN_ROLE_ID)
+from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_COMMUNITY_CHANNEL_ID, FEED_POLL_MINUTES,
+                    FEED_ROUNDUP_CHANNEL_ID, FEED_ROUNDUP_TIMEZONE, FEED_SUGGESTIONS_CHANNEL_ID,
+                    FEED_THREAD_CHANNEL_IDS, FEED_VOTE_EMOJI, RSS_ADMIN_ROLE_ID)
 from feed_reader import FeedError, RateLimited
 
 logger = logging.getLogger("followup-bot")
@@ -52,8 +52,9 @@ ROUNDUP_ACTIONS = [
 
 
 def build_roundup(posts: list[dict], now: datetime, votes: dict[str, int] | None = None) -> discord.Embed | None:
-    """The weekly roundup: last week's posts grouped per blogger (in the order
-    they first posted), plus the week's three most-voted posts by
+    """The weekly roundup of the community channel, for #general: last week's
+    posts grouped per blogger (in the order they first posted), plus the
+    week's three most-voted posts by
     FEED_VOTE_EMOJI reactions. None for a quiet week. Mentions in embeds never
     ping, so crediting people here is silent."""
     votes = votes or {}
@@ -81,7 +82,8 @@ def build_roundup(posts: list[dict], now: datetime, votes: dict[str, int] | None
         return f"[{title}](<{p['link']}>)"
 
     header = (f"**{len(posts)} new post{'s' if len(posts) != 1 else ''} from {len(groups)} "
-              f"blogger{'s' if len(groups) != 1 else ''}** this week. Thanks for writing! 💙\n")
+              f"blogger{'s' if len(groups) != 1 else ''}** in <#{FEED_COMMUNITY_CHANNEL_ID}> this week. "
+              "Thanks for writing! 💙\n")
     body, shown = "", 0
     for group in groups.values():
         block = f"\n{who(group['author_id'], group['feed_title'])}"
@@ -690,7 +692,7 @@ class FeedCommands(commands.Cog):
         if await db.get_setting("feed_roundup_last_week") == week:
             return False
         await db.set_setting("feed_roundup_last_week", week)  # first, so a crash can't post it twice
-        posts = await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID))
+        posts = await db.roundup_posts(str(FEED_COMMUNITY_CHANNEL_ID))
         embed = build_roundup(posts, now, await self._vote_counts(posts))
         channel = self.bot.get_channel(FEED_ROUNDUP_CHANNEL_ID)
         if embed is None or channel is None:
@@ -735,7 +737,7 @@ class FeedCommands(commands.Cog):
             return
         now = datetime.now(ROUNDUP_TZ)
         await interaction.response.defer(ephemeral=True)  # counting votes can take longer than Discord's 3 s
-        posts = await db.roundup_posts(str(FEED_ROUNDUP_CHANNEL_ID))
+        posts = await db.roundup_posts(str(FEED_COMMUNITY_CHANNEL_ID))
         embed = build_roundup(posts, now, await self._vote_counts(posts))
         reply = interaction.followup.send
         if embed is None:
@@ -911,11 +913,11 @@ class FeedCommands(commands.Cog):
 
     async def _finish_post(self, message: discord.Message, title: str, summary: bool = False) -> str:
         """What every post gets, however it was posted: the vote emoji in the
-        roundup channel (not on summaries: a vote there can't tell posts
+        community channel (not on summaries: a vote there can't tell posts
         apart) and a discussion thread in thread channels. Neither failing
         counts the post as unposted. Returns a note for the log."""
         notes = []
-        if message.channel.id == FEED_ROUNDUP_CHANNEL_ID and not summary:
+        if message.channel.id == FEED_COMMUNITY_CHANNEL_ID and not summary:
             notes.append("vote " + ("ok" if await self._add_vote(message) else "FAILED"))
         if message.channel.id in FEED_THREAD_CHANNEL_IDS:
             notes.append("thread " + ("ok" if await self._open_thread(message, title) else "FAILED"))
