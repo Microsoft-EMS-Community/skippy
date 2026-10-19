@@ -29,6 +29,7 @@ logger = logging.getLogger("followup-bot")
 ALERT_AFTER_FAILURES = max(1, 60 // FEED_POLL_MINUTES)  # an hour of failed checks
 CONCURRENT_CHECKS = 5     # feeds checked at once, so slow or dead ones can't hold up the rest
 MAX_PENDING_SUGGESTIONS = 3  # per member, so nobody can flood the mods' queue
+REFUSAL_REPEAT_SECONDS = 3600  # a member retrying the same refused blog is reported to the mods once an hour
 THREAD_ARCHIVE_MINUTES = 4320  # discussion threads on posts go quiet after 3 days
 ACTIVITY_DAYS = 30        # activity window, and the grace period for newly linked authors
 
@@ -193,6 +194,7 @@ class FeedCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.skip_until: dict[int, float] = {}  # feed id -> monotonic time a site asked us to wait until
+        self.refusals_told: dict[tuple[str, str], float] = {}  # (member, blog) -> when the mods were last told
         self.poll.start()
         self.weekly_roundup.start()
 
@@ -484,46 +486,54 @@ class FeedCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         url = feed_reader.normalize_url(url)
         guild_id, member_id, author_id = str(interaction.guild_id), str(interaction.user.id), str(author.id)
+        yours = author_id == member_id
         if author.bot:
-            await interaction.followup.send("The author has to be a member who writes the blog, not a bot.",
-                                            ephemeral=True)
+            await self._refuse(interaction, url, author, "The author has to be a member who writes the blog, "
+                               "not a bot.", "the author is a bot")
             return
         if duplicate := await self._duplicate_of(guild_id, url, set()):
-            await interaction.followup.send(self._already_tracked(duplicate, member_id, author_id), ephemeral=True)
+            await self._refuse(interaction, url, author, self._already_tracked(duplicate, member_id, author_id),
+                               self._already_tracked_reason(duplicate))
             return
-        yours = author_id == member_id
         if blog := await self._feed_by_author(guild_id, author_id):
             has = "You already have" if yours else f"{author.mention} already has"
-            await interaction.followup.send(f"{has} a blog on the feed: **{self._name(blog)}**. Each member "
-                                            "has one; ask a mod if it should be swapped.", ephemeral=True)
+            await self._refuse(interaction, url, author,
+                               f"{has} a blog on the feed: **{self._name(blog)}**. Each member has one; ask a mod "
+                               "if it should be swapped.",
+                               f"{author.mention} already has a blog on the feed: feed #{blog['id']} "
+                               f"**{self._name(blog)}**")
             return
         pending = await db.pending_suggestions(guild_id)
-        if any(s["author_id"] == author_id for s in pending):
+        if waiting := next((w for w in pending if w["author_id"] == author_id), None):
             whose = "your" if yours else f"{author.mention}'s"
-            await interaction.followup.send(f"There's already a suggestion waiting for {whose} blog; "
-                                            "the mods will look at it soon.", ephemeral=True)
+            await self._refuse(interaction, url, author, f"There's already a suggestion waiting for {whose} blog; "
+                               "the mods will look at it soon.",
+                               f"a suggestion for {author.mention}'s blog is already waiting (#{waiting['id']})")
             return
         same_url = feed_reader.comparable_url(url)
-        if any(feed_reader.comparable_url(s["url"]) == same_url for s in pending):
-            await interaction.followup.send("Someone already suggested that feed; the mods will look at it soon.",
-                                            ephemeral=True)
+        if waiting := next((w for w in pending if feed_reader.comparable_url(w["url"]) == same_url), None):
+            await self._refuse(interaction, url, author, "Someone already suggested that feed; the mods will look "
+                               "at it soon.", f"the same feed is already waiting (#{waiting['id']})")
             return
         if len(await db.pending_suggestions(guild_id, suggested_by=member_id)) >= MAX_PENDING_SUGGESTIONS:
-            await interaction.followup.send(
-                f"You have {MAX_PENDING_SUGGESTIONS} suggestions waiting already; please wait for the mods "
-                "to get to those first.", ephemeral=True)
+            await self._refuse(interaction, url, author,
+                               f"You have {MAX_PENDING_SUGGESTIONS} suggestions waiting already; please wait for "
+                               "the mods to get to those first.",
+                               f"they have {MAX_PENDING_SUGGESTIONS} suggestions waiting already")
             return
         async with feed_reader.session() as http:
             try:
                 title, items = feed_reader.parse_feed((await feed_reader.fetch_feed(http, url)).data)
             except FeedError as e:
-                await interaction.followup.send(
-                    f"I couldn't read that as a feed: {e}. Look for the blog's RSS or Atom link; "
-                    "it often ends in `/feed`, `/rss` or `/atom.xml`.", ephemeral=True)
+                await self._refuse(interaction, url, author,
+                                   f"I couldn't read that as a feed: {e}. Look for the blog's RSS or Atom link; "
+                                   "it often ends in `/feed`, `/rss` or `/atom.xml`.",
+                                   f"couldn't read it as a feed: {e}")
                 return
         # The same blog at another address (/feed and /rss, say) has the same posts.
         if duplicate := await self._duplicate_of(guild_id, url, feed_reader.item_ids(items)):
-            await interaction.followup.send(self._already_tracked(duplicate, member_id, author_id), ephemeral=True)
+            await self._refuse(interaction, url, author, self._already_tracked(duplicate, member_id, author_id),
+                               self._already_tracked_reason(duplicate))
             return
 
         suggestion_id = await db.add_suggestion(guild_id, url, title, member_id, author_id, note)
@@ -559,6 +569,32 @@ class FeedCommands(commands.Cog):
             f"🙏 Thanks! **{discord.utils.escape_markdown(title or url)}** went to the mods. "
             "I'll DM you when they've decided.", ephemeral=True)
         logger.info("Feed suggestion #%s by %s: %s", suggestion_id, interaction.user, url)
+
+    async def _refuse(self, interaction: discord.Interaction, url: str, author: discord.Member,
+                      answer: str, reason: str):
+        """Turn down a /blog suggest. The member gets `answer`; the mods get
+        `reason` in their channel, so they can reach out if needed, and in
+        the audit log (/audit). A member retrying the same blog is reported
+        once an hour, so retries can't flood the mods' channel."""
+        await interaction.followup.send(answer, ephemeral=True)
+        member = interaction.user
+        whose = "their" if author.id == member.id else f"{author.mention}'s"
+        text = f"suggested {whose} blog <{url[:300]}>, refused: {reason}"
+        logger.info("%s %s", member, text)
+        now = time.monotonic()
+        self.refusals_told = {k: t for k, t in self.refusals_told.items() if now - t < REFUSAL_REPEAT_SECONDS}
+        key = (str(member.id), feed_reader.comparable_url(url))
+        if key in self.refusals_told:
+            return
+        self.refusals_told[key] = now
+        await db.add_audit_log(action="feed_suggestion_refused", actor_id=str(member.id),
+                               target_id=str(author.id), detail=f"<{url[:300]}>: {reason}")
+        await self._alert(f"🚫 {member.mention} {text}")
+
+    def _already_tracked_reason(self, feed: dict) -> str:
+        """For the mods: which feed a refused suggestion duplicates, and whom it credits."""
+        credit = f"credited to <@{feed['author_id']}>" if feed["author_id"] else "no author yet"
+        return f"it's already on the feed as feed #{feed['id']} **{self._name(feed)}** ({credit})"
 
     def _already_tracked(self, feed: dict, member_id: str, author_id: str) -> str:
         """The answer to suggesting a blog that's already on the feed."""

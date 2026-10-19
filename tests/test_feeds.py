@@ -95,6 +95,7 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
         self.cog.bot = bot
         bot.user = mock.Mock(id=SKIPPY_ID)
         self.cog.skip_until = {}
+        self.cog.refusals_told = {}
         self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/feed", "Blog", "42", "9")
         await db.mark_feed_items_seen(self.feed_id, ["a", "b"])  # what /feed add does
 
@@ -547,7 +548,9 @@ class FeedCommandTestCase(FeedTestCase):
     async def suggest(self, url, result=None, author=None, user_id="300"):
         """A suggestion by member user_id, who picks author (themselves unless given)."""
         i = self.guild_interaction(user_id)
-        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=result or rss("x"))):
+        result = result or rss("x")
+        fetch = mock.AsyncMock(side_effect=result) if isinstance(result, Exception) else mock.AsyncMock(return_value=result)
+        with mock.patch.object(feed_reader, "fetch_feed", fetch):
             await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, author or i.user)
         return i.followup.send.await_args.args[0]
 
@@ -656,6 +659,54 @@ class AuthorTests(FeedCommandTestCase):
     async def test_mods_adding_a_community_feed_without_an_author_are_told(self):
         self.assertIn("No author", await self.add("https://news.example/feed", rss("x")))
         self.assertNotIn("No author", await self.add("https://ms.example/feed", rss("y"), channel="222"))
+
+
+class RefusalReportTests(FeedCommandTestCase):
+    """A refused /blog suggest is reported to the mods, so they can reach
+    out. Feed #1 (https://example.com/feed) is linked to member 77."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+
+    def reports(self):
+        return [content for content, _ in self.alerts.sent if content.startswith("🚫")]
+
+    async def test_mods_see_who_tried_what_and_why_without_pings(self):
+        await self.suggest("https://second.example/feed", user_id="77")
+        self.assertEqual(self.reports(), ["🚫 <@77> suggested their blog <https://second.example/feed>, refused: "
+                                          "<@77> already has a blog on the feed: feed #1 **Blog**"])
+        mentions = self.alerts.sent[-1][1]
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
+        entry = (await db.get_recent_audit_log(1))[0]
+        self.assertEqual((entry["action"], entry["actor_id"], entry["target_id"]),
+                         ("feed_suggestion_refused", "77", "77"))
+
+    async def test_every_kind_of_refusal_is_reported(self):
+        bot = member(302)
+        bot.bot = True
+        await self.suggest("https://bot.example/feed", author=bot)
+        await self.suggest("http://www.example.com/feed/", author=member(301))
+        await self.suggest("https://broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        reports = self.reports()
+        self.assertIn("the author is a bot", reports[0])
+        self.assertIn("suggested <@301>'s blog", reports[1])
+        self.assertIn("already on the feed as feed #1 **Blog** (credited to <@77>)", reports[1])
+        self.assertIn("couldn't read it as a feed: HTTP 404", reports[2])
+
+    async def test_retrying_the_same_blog_is_reported_once_an_hour(self):
+        for _ in range(3):
+            await self.suggest("https://broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        self.assertEqual(len(self.reports()), 1)
+        await self.suggest("https://other-broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        self.assertEqual(len(self.reports()), 2)
+        self.cog.refusals_told = {k: t - feeds.REFUSAL_REPEAT_SECONDS for k, t in self.cog.refusals_told.items()}
+        await self.suggest("https://broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        self.assertEqual(len(self.reports()), 3)
+
+    async def test_accepted_suggestions_are_not_reported(self):
+        await self.suggest("https://fine.example/feed")
+        self.assertEqual(self.reports(), [])
 
 
 class ConsistentPostsTests(FeedTestCase):
