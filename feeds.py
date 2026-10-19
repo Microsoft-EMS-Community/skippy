@@ -123,7 +123,6 @@ LINK_CHOICES = ([app_commands.Choice(name=label, value=site) for site, label in 
                 + [app_commands.Choice(name="all of them", value="all")])
 
 CLEARABLE_SETTINGS = [
-    app_commands.Choice(name="role ping", value="role_id"),
     app_commands.Choice(name="author", value="author_id"),
     app_commands.Choice(name="name (use the feed's own title)", value="display_name"),
     app_commands.Choice(name="include words", value="include_words"),
@@ -231,7 +230,7 @@ class FeedCommands(commands.Cog):
     # Commands
     # ──────────────────────────────────────────
 
-    async def _create_feed(self, guild: discord.Guild, url: str, channel_id: int, role_id: str | None,
+    async def _create_feed(self, guild: discord.Guild, url: str, channel_id: int,
                            author_id: str | None, added_by: str):
         """Check and add a feed; shared by /feed add and approving a suggestion.
         Returns (feed id, title, current items, channel). Raises
@@ -255,7 +254,7 @@ class FeedCommands(commands.Cog):
         if duplicate:
             raise FeedError(f"that's the same blog as feed #{duplicate['id']} **{self._name(duplicate)}**, "
                             f"which already posts in {channel.mention}")
-        feed_id = await db.add_feed(str(guild.id), str(channel.id), url, title, role_id, added_by)
+        feed_id = await db.add_feed(str(guild.id), str(channel.id), url, title, added_by)
         # Everything already in the feed counts as seen, so adding a feed
         # doesn't dump its whole history into the channel.
         await db.mark_feed_items_seen(feed_id, [i.key for i in items])
@@ -297,14 +296,13 @@ class FeedCommands(commands.Cog):
     @feed.command(name="add", description="Post a feed's new items in one of the feed channels.")
     @app_commands.describe(url="The RSS or Atom feed URL",
                            channel=f"Where to post (default: #{next(iter(FEED_CHANNELS))})",
-                           role="Optional role to ping with every post",
                            author="The member who writes it: credited and pinged on posts, and activity-tracked",
                            name="What posts call it, if the feed's own title isn't good (e.g. just \"Blog\")",
                            **LINK_OPTIONS)
     @app_commands.choices(channel=CHANNEL_CHOICES)
     @is_rss_admin()
     async def feed_add(self, interaction: discord.Interaction, url: str, channel: str | None = None,
-                       role: discord.Role | None = None, author: discord.Member | None = None,
+                       author: discord.Member | None = None,
                        name: app_commands.Range[str, 1, 80] | None = None, linkedin: str | None = None,
                        x: str | None = None, youtube: str | None = None, github: str | None = None):
         await interaction.response.defer(ephemeral=True)
@@ -321,7 +319,7 @@ class FeedCommands(commands.Cog):
         try:
             feed_id, title, items, target = await self._create_feed(
                 interaction.guild, url, int(channel) if channel else DEFAULT_CHANNEL_ID,
-                str(role.id) if role else None, str(author.id) if author else None, str(interaction.user.id))
+                str(author.id) if author else None, str(interaction.user.id))
         except FeedError as e:
             await interaction.followup.send(f"Couldn't add that feed: {e}.", ephemeral=True)
             return
@@ -330,9 +328,6 @@ class FeedCommands(commands.Cog):
             return
 
         notes = []
-        if role and not role.mentionable and not target.permissions_for(interaction.guild.me).mention_everyone:
-            notes.append(f"\n⚠️ {role.mention} isn't mentionable and I can't mention all roles, "
-                         "so posts will show the role without pinging anyone.")
         if author:
             notes.append(f"\n👤 Posts credit {author.mention}, who's now on the RSS watchlist.")
         if links:
@@ -387,13 +382,12 @@ class FeedCommands(commands.Cog):
         lines = []
         for f in feeds:
             status = f"⚠️ failing: {f['last_error']}" if f["failures"] else "✅"
-            role = f" · pings <@&{f['role_id']}>" if f["role_id"] else ""
             author = f" · by <@{f['author_id']}>" if f["author_id"] else ""
             if f["author_id"] and mode != "off" and not f["activity_exempt"]:
                 author += " " + ACTIVITY_BADGES[(await self._author_status(f["author_id"], min_messages))[0]]
             filters = " · 🔎 filtered" if f["include_words"] or f["exclude_words"] else ""
             name = discord.utils.escape_markdown(feed_name(f))
-            lines.append(f"`#{f['id']}` **{name}** → <#{f['channel_id']}>{author}{role}{filters} · {status}")
+            lines.append(f"`#{f['id']}` **{name}** → <#{f['channel_id']}>{author}{filters} · {status}")
         embed = discord.Embed(title="📰 Feeds", description="\n".join(lines)[:4000], color=discord.Color.blurple())
         embed.set_footer(text=f"{len(feeds)} feed(s) · checked every {FEED_POLL_MINUTES} minutes · "
                               "details: /feed edit")
@@ -403,7 +397,6 @@ class FeedCommands(commands.Cog):
     @app_commands.describe(
         feed="The feed to change",
         channel="Move it to another feed channel",
-        role="Role to ping with every post",
         author="The member who writes it: credited and pinged on posts, and activity-tracked",
         name="What posts call it, instead of the feed's own title",
         include="Only post titles mentioning one of these words (comma-separated)",
@@ -416,7 +409,7 @@ class FeedCommands(commands.Cog):
     @app_commands.choices(channel=CHANNEL_CHOICES, clear=CLEARABLE_SETTINGS)
     @is_rss_admin()
     async def feed_edit(self, interaction: discord.Interaction, feed: int, channel: str | None = None,
-                        role: discord.Role | None = None, author: discord.Member | None = None,
+                        author: discord.Member | None = None,
                         name: app_commands.Range[str, 1, 80] | None = None,
                         include: str | None = None, exclude: str | None = None,
                         highlight: str | None = None,
@@ -463,8 +456,6 @@ class FeedCommands(commands.Cog):
                     ephemeral=True)
                 return
             changes["channel_id"] = channel
-        if role:
-            changes["role_id"] = str(role.id)
         if name and name.strip():
             changes["display_name"] = name.strip()
         for setting, value in (("include_words", include), ("exclude_words", exclude),
@@ -494,7 +485,7 @@ class FeedCommands(commands.Cog):
         await interaction.response.send_message(f"{verb} feed #{feed}:\n{self._describe(row, shown_links)}",
                                                 ephemeral=True)
         if changes:
-            labels = {"channel_id": "channel", "role_id": "ping role", "author_id": "author", "display_name": "name",
+            labels = {"channel_id": "channel", "author_id": "author", "display_name": "name",
                       "include_words": "include words", "exclude_words": "exclude words",
                       "highlight_words": "highlight words", "summary_after": "summary threshold",
                       "activity_exempt": "activity exemption", "links": "profile links"}
@@ -711,7 +702,7 @@ class FeedCommands(commands.Cog):
         author_id = suggestion["author_id"]
         try:
             feed_id, title, items, channel = await self._create_feed(
-                interaction.guild, suggestion["url"], DEFAULT_CHANNEL_ID, None, author_id, str(interaction.user.id))
+                interaction.guild, suggestion["url"], DEFAULT_CHANNEL_ID, author_id, str(interaction.user.id))
         except (FeedError, sqlite3.IntegrityError) as e:
             await db.decide_suggestion(suggestion_id, "pending", None)  # back in the queue, buttons stay
             problem = "it already posts in that channel" if isinstance(e, sqlite3.IntegrityError) else str(e)
@@ -1102,16 +1093,15 @@ class FeedCommands(commands.Cog):
         the feed's summary_after. Archives what was posted and returns its keys."""
         if not items:
             return set()
-        role_id, author_id = feed["role_id"], feed["author_id"]
-        # Only the feed's own role and author can be pinged, never anyone else.
-        mentions = discord.AllowedMentions(everyone=False,
-                                           users=[discord.Object(int(author_id))] if author_id and ping else False,
-                                           roles=[discord.Object(int(role_id))] if role_id and ping else False)
+        author_id = feed["author_id"]
+        # Only the feed's own author can be pinged, never anyone else.
+        mentions = discord.AllowedMentions(everyone=False, roles=False,
+                                           users=[discord.Object(int(author_id))] if author_id and ping else False)
         posted, archive = set(), []
         try:
             if len(items) > feed["summary_after"]:
                 highlight = feed_reader.word_list(feed["highlight_words"])
-                for part in feed_reader.format_summary(name, items, highlight, role_id, author_id=author_id):
+                for part in feed_reader.format_summary(name, items, highlight, author_id=author_id):
                     message = await channel.send(part, allowed_mentions=mentions)
                     if not posted:  # once the first part is out, don't repeat the summary on a retry
                         posted = {i.key for i in items}
@@ -1123,7 +1113,7 @@ class FeedCommands(commands.Cog):
             else:
                 links_line = await self._links_line(author_id)
                 for item in items:
-                    message = await channel.send(feed_reader.format_post(name, item, role_id, author_id, links_line),
+                    message = await channel.send(feed_reader.format_post(name, item, author_id, links_line),
                                                  allowed_mentions=mentions)
                     posted.add(item.key)
                     archive.append((item, message.jump_url))
@@ -1189,14 +1179,12 @@ class FeedCommands(commands.Cog):
         none = "—"
         shown = " · ".join(f"[{label}](<{links[site]}>)" for site, label in profile_links.SITES.items()
                            if (links or {}).get(site))
-        role = f"<@&{feed['role_id']}>" if feed["role_id"] else none
         author = f"<@{feed['author_id']}>" if feed["author_id"] else none
         return "\n".join([
             f"**{discord.utils.escape_markdown(feed_name(feed))}** <{feed['url']}>"
             + (f" (the feed calls itself \"{discord.utils.escape_markdown(feed['title'])}\")"
                if feed["display_name"] and feed["title"] and feed["title"] != feed["display_name"] else ""),
             f"Channel: <#{feed['channel_id']}>",
-            f"Ping role: {role}",
             f"Author: {author}",
             f"Author's profile links: {shown or none}",
             f"Only titles with: {feed['include_words'] or 'anything'}",
