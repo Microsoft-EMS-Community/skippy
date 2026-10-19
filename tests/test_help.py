@@ -33,6 +33,9 @@ class HelpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Moderators: feeds", names)
         self.assertIn("/blog suggest", embed.fields[0].value)
         self.assertIn("/blog search", embed.fields[0].value)
+        feed = next(f for f in embed.fields if f.name == "Community feed")
+        self.assertIn(f"<#{commands.FEED_COMMUNITY_CHANNEL_ID}>", feed.value)
+        self.assertIn(f"roundup in <#{commands.FEED_ROUNDUP_CHANNEL_ID}>", feed.value)
 
     async def test_moderators_also_see_feed_commands(self):
         embed = await help_for([commands.RSS_ADMIN_ROLE_ID])

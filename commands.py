@@ -11,7 +11,7 @@ import datetime
 import db
 import followup_notify
 from config import GUILD_ID, AWAITING_ROLE_ID, HELPER_ROLE_IDS, RSS_ADMIN_ROLE_ID, RSS_AUDIT_CHANNEL_ID
-from config import FEED_ROUNDUP_CHANNEL_ID, FEED_VOTE_EMOJI
+from config import FEED_COMMUNITY_CHANNEL_ID, FEED_ROUNDUP_CHANNEL_ID, FEED_VOTE_EMOJI
 
 
 def is_helper():
@@ -283,9 +283,9 @@ class FollowUpCommands(commands.Cog):
         embed.add_field(
             name="Community feed",
             value=(
-                f"New posts from the community's blogs land in <#{FEED_ROUNDUP_CHANNEL_ID}>, each with a "
-                "discussion thread. Vote for your favourites with "
-                f"{FEED_VOTE_EMOJI}: every Monday the roundup recaps the week and crowns the 3 most-voted posts."
+                f"New posts from the community's blogs land in <#{FEED_COMMUNITY_CHANNEL_ID}>, each with a "
+                f"discussion thread. Vote for your favourites with {FEED_VOTE_EMOJI}: every Monday the "
+                f"roundup in <#{FEED_ROUNDUP_CHANNEL_ID}> recaps the week and crowns the 3 most-voted posts."
             ),
             inline=False
         )

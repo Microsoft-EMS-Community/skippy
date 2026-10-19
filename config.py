@@ -63,11 +63,12 @@ FEED_CHANNELS = {
 FEED_POLL_MINUTES = 5                         # How often every feed is checked
 FEED_ALERT_CHANNEL_ID = RSS_AUDIT_CHANNEL_ID  # Where failing feeds are reported
 FEED_SUGGESTIONS_CHANNEL_ID = RSS_AUDIT_CHANNEL_ID  # Where mods get /blog suggest cards to approve or reject
-FEED_THREAD_CHANNEL_IDS = {FEED_CHANNELS["community-feed"]}  # Posts here get a discussion thread
-FEED_ROUNDUP_CHANNEL_ID = FEED_CHANNELS["community-feed"]  # Weekly roundup of this channel's feeds, posted here
+FEED_COMMUNITY_CHANNEL_ID = FEED_CHANNELS["community-feed"]  # The community's blogs: voted on and rounded up weekly
+FEED_THREAD_CHANNEL_IDS = {FEED_COMMUNITY_CHANNEL_ID}       # Posts here get a discussion thread
+FEED_ROUNDUP_CHANNEL_ID = 1008077287813550093               # #general: where the weekly roundup is posted
 FEED_ROUNDUP_TIMEZONE = "Europe/Copenhagen"                 # The roundup goes out Mondays 09:00 in this timezone
-# Added to every post in the roundup channel; the roundup's top 3 are the posts
-# with the most of these. The server's own :msems: emoji ("<:name:id>" format).
+# Added to every post in the community channel; the roundup's top 3 are the
+# posts with the most of these. The server's own :msems: emoji ("<:name:id>" format).
 FEED_VOTE_EMOJI = "<:msems:1368551524963192842>"
 
 # New Account heuristic tagging

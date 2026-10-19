@@ -262,9 +262,10 @@ only those. Members with the RSS admin role manage feeds with `/feed`.
   get a grace period. Feeds without an author, and ones exempted with
   `/feed edit activity_exempt:True`, are never affected.
 - **Weekly roundup:** Mondays 09:00 Danish time (`FEED_ROUNDUP_TIMEZONE`),
-  #community-feed (`FEED_ROUNDUP_CHANNEL_ID`) gets a recap of the week's
-  posts from its feeds, grouped per blogger, with the week's 🏆 community
-  favourites: the 3 posts with the most :msems: votes (`FEED_VOTE_EMOJI`).
+  #general (`FEED_ROUNDUP_CHANNEL_ID`) gets a recap of the week's posts in
+  #community-feed (`FEED_COMMUNITY_CHANNEL_ID`), grouped per blogger, with
+  the week's 🏆 community favourites: the 3 posts with the most :msems: votes
+  (`FEED_VOTE_EMOJI`).
   Skippy adds the emoji to each post so voting is one click; its own and the
   author's votes don't count, nor do posts that went out in a summary.
   Nobody is pinged. A week without posts gets no roundup. Mods preview it,

@@ -26,6 +26,7 @@ import feeds  # noqa: E402
 from feed_reader import FeedError, FetchResult  # noqa: E402
 
 CHANNEL_ID, ALERT_CHANNEL_ID = 111, feeds.FEED_ALERT_CHANNEL_ID
+GENERAL_ID = 333  # where the roundup goes
 
 
 def rss(*keys):
@@ -377,12 +378,18 @@ MONDAY_9 = datetime(2026, 10, 19, 9, 0, tzinfo=feeds.ROUNDUP_TZ)
 
 
 class RoundupTests(FeedTestCase):
+    """#community-feed's posts are voted on there and rounded up in #general."""
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        for name, value in (("FEED_ROUNDUP_CHANNEL_ID", CHANNEL_ID), ("FEED_VOTE_EMOJI", "👍")):
+        for name, value in (("FEED_COMMUNITY_CHANNEL_ID", CHANNEL_ID), ("FEED_ROUNDUP_CHANNEL_ID", GENERAL_ID),
+                            ("FEED_VOTE_EMOJI", "👍")):
             patcher = mock.patch.object(feeds, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.general = FakeChannel(GENERAL_ID)
+        self.cog.bot.get_channel = {CHANNEL_ID: self.channel, ALERT_CHANNEL_ID: self.alerts,
+                                    GENERAL_ID: self.general}.get
 
     def test_build_groups_per_blogger_in_posting_order_with_a_vote_podium(self):
         posts = [post("A1", "77"), post("B1", None, 2, "Some *Blog*"), post("A2", "77"), post("C1", "99", 3)]
@@ -392,7 +399,7 @@ class RoundupTests(FeedTestCase):
         embed = feeds.build_roundup(posts, MONDAY_9, votes)
         self.assertEqual(embed.title, "📰 Community roundup · week 42")
         lines = embed.description.splitlines()
-        self.assertEqual(lines[0], "**4 new posts from 3 bloggers** this week. Thanks for writing! 💙")
+        self.assertEqual(lines[0], "**4 new posts from 3 bloggers** in <#111> this week. Thanks for writing! 💙")
         self.assertEqual(lines[2:5], ["<@77>", "• [A1](<https://e.com/A1>)", "• [A2](<https://e.com/A2>)"])
         self.assertIn("**Some \\*Blog\\***", embed.description)  # feeds without an author by name
         self.assertEqual(embed.fields[0].name, "🏆 Community favourites this week")
@@ -433,7 +440,8 @@ class RoundupTests(FeedTestCase):
         self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=1)))  # Tuesday
         self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(minutes=3)))
         self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(hours=2)))  # already out
-        self.assertEqual(len(self.channel.embeds), 1)
+        self.assertEqual(len(self.general.embeds), 1)
+        self.assertEqual(self.channel.embeds, [])  # in #general, not in the feed channel
         self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))  # next week
 
     async def test_switched_off_or_quiet_posts_nothing(self):
@@ -441,12 +449,12 @@ class RoundupTests(FeedTestCase):
         await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
         await db.set_setting("feed_roundup", "off")
         self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))
-        self.assertEqual(self.channel.embeds, [])
+        self.assertEqual(self.general.embeds, [])
 
-    async def test_posts_in_the_roundup_channel_get_the_vote_emoji(self):
+    async def test_posts_in_the_community_channel_get_the_vote_emoji(self):
         await self.check(rss("c", "a", "b"))
         self.assertEqual(self.channel.votes_added, [(1, "👍")])
-        with mock.patch.object(feeds, "FEED_ROUNDUP_CHANNEL_ID", 222):  # any other channel: no vote emoji
+        with mock.patch.object(feeds, "FEED_COMMUNITY_CHANNEL_ID", 222):  # any other channel: no vote emoji
             await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(len(self.channel.votes_added), 1)
 
@@ -475,9 +483,9 @@ class RoundupTests(FeedTestCase):
         i = interaction()
         await feeds.FeedCommands.feed_roundup.callback(self.cog, i)  # default: preview
         self.assertTrue(i.followup.send.await_args.kwargs["ephemeral"])
-        self.assertEqual(self.channel.embeds, [])
+        self.assertEqual(self.general.embeds, [])
         await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="post")
-        self.assertEqual(len(self.channel.embeds), 1)
+        self.assertEqual(len(self.general.embeds), 1)
         self.assertIsNotNone(await db.get_setting("feed_roundup_last_week"))  # Monday won't repeat it
         await feeds.FeedCommands.feed_roundup.callback(self.cog, interaction(), action="off")
         self.assertEqual(await db.get_setting("feed_roundup"), "off")
@@ -514,7 +522,7 @@ class ConsistentPostsTests(FeedTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        for name, value in (("FEED_ROUNDUP_CHANNEL_ID", CHANNEL_ID), ("FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}),
+        for name, value in (("FEED_COMMUNITY_CHANNEL_ID", CHANNEL_ID), ("FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}),
                             ("FEED_VOTE_EMOJI", "👍")):
             patcher = mock.patch.object(feeds, name, value)
             patcher.start()
