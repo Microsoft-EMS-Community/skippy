@@ -46,7 +46,7 @@ class FakeChannel:
         self.embeds, self.votes_added, self.messages = [], [], {}
         self.thread_error = None
 
-    async def send(self, content=None, allowed_mentions=None, embed=None):
+    async def send(self, content=None, allowed_mentions=None, embed=None, view=None):
         if embed is not None:
             self.embeds.append(embed)
             return mock.Mock()
@@ -515,6 +515,83 @@ class FeedNameTests(FeedTestCase):
         self.assertEqual((await db.get_feed(self.feed_id, "1"))["display_name"], "CirriusTech")
         await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id, clear="display_name")
         self.assertEqual(feeds.feed_name(await db.get_feed(self.feed_id, "1")), "Blog")
+
+
+class DuplicateTests(FeedTestCase):
+    """The same blog never posts twice in a channel, however it's added.
+    Feed #1 is https://example.com/feed (items a and b) in CHANNEL_ID."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        for name, value in (("FEED_CHANNELS", {"community-feed": CHANNEL_ID, "ms-blogs": 222}),
+                            ("DEFAULT_CHANNEL_ID", CHANNEL_ID)):
+            patcher = mock.patch.object(feeds, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.cog._post = mock.AsyncMock(return_value=set())
+        self.cog._dm = mock.AsyncMock()
+
+    def guild_interaction(self, user_id="500"):
+        i = interaction(user_id)
+        i.user.joined_at = None
+        channels = {cid: mock.Mock(spec=discord.TextChannel, id=cid, mention=f"<#{cid}>") for cid in (CHANNEL_ID, 222)}
+        i.guild.get_channel = channels.get
+        return i
+
+    async def add(self, url, result, channel=None):
+        i = self.guild_interaction()
+        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=result)):
+            await feeds.FeedCommands.feed_add.callback(self.cog, i, url, channel=channel)
+        return i.followup.send.await_args.args[0]
+
+    async def suggest(self, url, result=None, own_blog=True, user_id="300"):
+        i = self.guild_interaction(user_id)
+        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=result or rss("x"))):
+            await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, own_blog)
+        return i.followup.send.await_args.args[0]
+
+    async def test_the_same_feed_written_differently_is_refused(self):
+        for url in ("http://www.example.com/feed/", "EXAMPLE.com/feed?utm_source=mail"):
+            self.assertIn("same blog as feed #1", await self.add(url, rss("x", "y")))
+        self.assertEqual(len(await db.get_feeds("1")), 1)
+
+    async def test_the_same_blog_at_another_address_is_refused(self):
+        self.assertIn("same blog as feed #1", await self.add("https://example.com/rss", rss("c", "b")))
+
+    async def test_another_channel_or_another_blog_is_fine(self):
+        self.assertIn("✅ Added", await self.add("https://example.com/feed", rss("a", "b"), channel="222"))
+        self.assertIn("✅ Added", await self.add("https://other.example/feed", rss("x", "y")))
+
+    async def test_moving_a_feed_next_to_the_same_blog_is_refused(self):
+        await self.add("https://example.com/rss", rss("a", "b"), channel="222")  # feed #2
+        i = interaction()
+        await feeds.FeedCommands.feed_edit.callback(self.cog, i, 2, channel=str(CHANNEL_ID))
+        self.assertIn("Feed #1 **Blog** already posts that blog", i.response.send_message.await_args.args[0])
+        self.assertEqual((await db.get_feed(2, "1"))["channel_id"], "222")
+
+    async def test_approving_a_duplicate_keeps_the_suggestion_open(self):
+        sid = await db.add_suggestion("1", "https://example.com/rss", "Blog", "300", True, None)
+        i = self.guild_interaction()
+        with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("b"))):
+            await self.cog.approve_suggestion(i, sid)
+        self.assertIn("same blog as feed #1", i.followup.send.await_args.args[0])
+        self.assertEqual((await db.get_suggestion(sid))["status"], "pending")
+
+    async def test_suggesting_a_blog_already_on_the_feed(self):
+        self.assertIn("already on the feed as **Blog**", await self.suggest("http://example.com/feed/"))
+        self.assertIn("already on the feed", await self.suggest("https://example.com/rss", rss("c", "a")))
+        self.assertEqual(await db.pending_suggestions("1"), [])
+
+    async def test_the_answer_says_whether_it_credits_you(self):
+        self.assertIn("ask a mod to credit you", await self.suggest("https://example.com/feed"))
+        self.assertNotIn("credit", await self.suggest("https://example.com/feed", own_blog=False))
+        await feeds.FeedCommands._link_author(self.feed_id, "1", "300", "9")
+        self.assertIn("Its posts credit you", await self.suggest("https://example.com/feed"))
+
+    async def test_the_same_suggestion_written_differently_waits_once(self):
+        self.assertIn("went to the mods", await self.suggest("https://new.example/feed"))
+        self.assertIn("already suggested", await self.suggest("http://www.new.example/feed/", user_id="301"))
+        self.assertEqual(len(await db.pending_suggestions("1")), 1)
 
 
 class ConsistentPostsTests(FeedTestCase):

@@ -138,6 +138,24 @@ class SelectAndFormatTests(unittest.TestCase):
         self.assertEqual(feed_reader.normalize_url("http://e.com/rss"), "http://e.com/rss")  # http stays http
 
 
+class SameFeedTests(unittest.TestCase):
+    def test_the_same_feed_written_differently_compares_equal(self):
+        same = {feed_reader.comparable_url(u) for u in (
+            "https://example.com/feed", "http://example.com/feed/", "https://www.Example.com/feed",
+            "<example.com/feed>", "https://example.com/feed?utm_source=newsletter", "https://example.com:443/feed")}
+        self.assertEqual(len(same), 1, same)
+
+    def test_different_feeds_stay_different(self):
+        urls = ("https://example.com/feed", "https://example.com/rss", "https://blog.example.com/feed",
+                "https://example.com/feed?tag=intune", "https://example.com:8080/feed")
+        self.assertEqual(len({feed_reader.comparable_url(u) for u in urls}), len(urls))
+
+    def test_items_are_known_by_key_and_link(self):
+        item = FeedItem("post-1", "Title", "https://example.com/post?utm_source=rss", None)
+        self.assertEqual(feed_reader.item_ids([item]),
+                         {"post-1", "https://example.com/post?utm_source=rss", "https://example.com/post"})
+
+
 class FetchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         app = web.Application()

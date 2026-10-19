@@ -219,8 +219,9 @@ class FeedCommands(commands.Cog):
                            author_id: str | None, added_by: str):
         """Check and add a feed; shared by /feed add and approving a suggestion.
         Returns (feed id, title, current items, channel). Raises
-        FeedError with a message for mods, or sqlite3.IntegrityError if the
-        URL already posts in that channel."""
+        FeedError with a message for mods, also when the same blog already
+        posts in that channel (sqlite3.IntegrityError if one was added at
+        the same moment)."""
         channel = guild.get_channel(channel_id) if channel_id in FEED_CHANNELS.values() else None
         if not isinstance(channel, discord.TextChannel):
             raise FeedError(f"feed channel {channel_id} doesn't exist anymore; update FEED_CHANNELS in config.py")
@@ -230,6 +231,10 @@ class FeedCommands(commands.Cog):
         async with feed_reader.session() as http:
             result = await feed_reader.fetch_feed(http, url)
             title, items = feed_reader.parse_feed(result.data)
+        duplicate = await self._duplicate_of(str(guild.id), url, feed_reader.item_ids(items), channel.id)
+        if duplicate:
+            raise FeedError(f"that's the same blog as feed #{duplicate['id']} **{self._name(duplicate)}**, "
+                            f"which already posts in {channel.mention}")
         feed_id = await db.add_feed(str(guild.id), str(channel.id), url, title, role_id, added_by)
         # Everything already in the feed counts as seen, so adding a feed
         # doesn't dump its whole history into the channel.
@@ -238,6 +243,22 @@ class FeedCommands(commands.Cog):
         if author_id:
             await self._link_author(feed_id, str(guild.id), author_id, added_by)
         return feed_id, title, items, channel
+
+    @staticmethod
+    async def _duplicate_of(guild_id: str, url: str, item_ids: set[str], channel_id: int | None = None,
+                            ignore_feed: int | None = None) -> dict | None:
+        """The feed that a new one would duplicate: the same feed URL written
+        differently, or a feed that already has any of its posts (the same
+        blog at another address, like /feed and /rss). Only feeds posting in
+        channel_id count when it's given."""
+        feeds = [f for f in await db.get_feeds(guild_id) if f["id"] != ignore_feed
+                 and (channel_id is None or int(f["channel_id"]) == channel_id)]
+        same_url = feed_reader.comparable_url(url)
+        for feed in feeds:
+            if feed_reader.comparable_url(feed["url"]) == same_url:
+                return feed
+        sharing = await db.feeds_with_items(item_ids) if item_ids else set()
+        return next((f for f in feeds if f["id"] in sharing), None)
 
     @staticmethod
     async def _link_author(feed_id: int, guild_id: str, author_id: str, linked_by: str):
@@ -364,6 +385,14 @@ class FeedCommands(commands.Cog):
             if int(channel) not in FEED_CHANNELS.values():
                 await interaction.response.send_message("That isn't one of the feed channels.", ephemeral=True)
                 return
+            row = await db.get_feed(feed, guild_id)
+            duplicate = await self._duplicate_of(guild_id, row["url"], await db.feed_item_ids(feed), int(channel),
+                                                 ignore_feed=feed)
+            if duplicate:
+                await interaction.response.send_message(
+                    f"Feed #{duplicate['id']} **{self._name(duplicate)}** already posts that blog in <#{channel}>.",
+                    ephemeral=True)
+                return
             changes["channel_id"] = channel
         if role:
             changes["role_id"] = str(role.id)
@@ -432,10 +461,11 @@ class FeedCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         url = feed_reader.normalize_url(url)
         guild_id, member_id = str(interaction.guild_id), str(interaction.user.id)
-        if await db.feed_url_tracked(guild_id, url):
-            await interaction.followup.send("That feed is already in the content tracker. 🎉", ephemeral=True)
+        if duplicate := await self._duplicate_of(guild_id, url, set()):
+            await interaction.followup.send(self._already_tracked(duplicate, member_id, own_blog), ephemeral=True)
             return
-        if await db.pending_suggestions(guild_id, url=url):
+        same_url = feed_reader.comparable_url(url)
+        if any(feed_reader.comparable_url(s["url"]) == same_url for s in await db.pending_suggestions(guild_id)):
             await interaction.followup.send("Someone already suggested that feed; the mods will look at it soon.",
                                             ephemeral=True)
             return
@@ -452,6 +482,10 @@ class FeedCommands(commands.Cog):
                     f"I couldn't read that as a feed: {e}. Look for the blog's RSS or Atom link; "
                     "it often ends in `/feed`, `/rss` or `/atom.xml`.", ephemeral=True)
                 return
+        # The same blog at another address (/feed and /rss, say) has the same posts.
+        if duplicate := await self._duplicate_of(guild_id, url, feed_reader.item_ids(items)):
+            await interaction.followup.send(self._already_tracked(duplicate, member_id, own_blog), ephemeral=True)
+            return
 
         suggestion_id = await db.add_suggestion(guild_id, url, title, member_id, own_blog, note)
         cards = self.bot.get_channel(FEED_SUGGESTIONS_CHANNEL_ID)
@@ -485,6 +519,15 @@ class FeedCommands(commands.Cog):
             f"🙏 Thanks! **{discord.utils.escape_markdown(title or url)}** went to the mods. "
             "I'll DM you when they've decided.", ephemeral=True)
         logger.info("Feed suggestion #%s by %s: %s", suggestion_id, interaction.user, url)
+
+    def _already_tracked(self, feed: dict, member_id: str, own_blog: bool) -> str:
+        """The answer to suggesting a blog that's already on the feed."""
+        text = f"That blog is already on the feed as **{self._name(feed)}**. 🎉"
+        if feed["author_id"] == member_id:
+            return text + " Its posts credit you."
+        if own_blog and not feed["author_id"]:
+            return text + " If it's yours, ask a mod to credit you on its posts."
+        return text
 
     async def approve_suggestion(self, interaction: discord.Interaction, suggestion_id: int):
         await interaction.response.defer()

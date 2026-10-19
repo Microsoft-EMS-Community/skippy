@@ -96,6 +96,7 @@ async def init_db():
                 posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS feed_posts_posted_at ON feed_posts (posted_at);
+            CREATE INDEX IF NOT EXISTS feed_items_item_key ON feed_items (item_key);
 
             CREATE TABLE IF NOT EXISTS feed_suggestions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -727,12 +728,28 @@ async def search_feed_posts(words: list[str], limit: int = 10) -> list[dict]:
         return [dict(r) for r in await cursor.fetchall()]
 
 
-async def feed_url_tracked(guild_id: str, url: str) -> bool:
+async def feeds_with_items(ids: set[str]) -> set[int]:
+    """The feeds that already have any of these items (feed_reader.item_ids),
+    as an item they've seen or a link they've posted."""
+    ids, found = list(ids), set()
+    async with aiosqlite.connect(DB_PATH) as db:
+        for start in range(0, len(ids), 400):  # stay well under SQLite's limit on query parameters
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            cursor = await db.execute(
+                f"""SELECT feed_id FROM feed_items WHERE item_key IN ({marks})
+                    UNION SELECT feed_id FROM feed_posts WHERE link IN ({marks})""", chunk + chunk)
+            found.update(row[0] for row in await cursor.fetchall())
+    return found
+
+
+async def feed_item_ids(feed_id: int) -> set[str]:
+    """What identifies a stored feed's items: seen item keys and posted links."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT 1 FROM feeds WHERE guild_id = ? AND url = ? LIMIT 1", (guild_id, url)
-        )
-        return await cursor.fetchone() is not None
+            "SELECT item_key FROM feed_items WHERE feed_id = ? UNION SELECT link FROM feed_posts WHERE feed_id = ?",
+            (feed_id, feed_id))
+        return {row[0] for row in await cursor.fetchall()}
 
 
 # ──────────────────────────────────────────────
