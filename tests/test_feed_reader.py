@@ -109,7 +109,7 @@ class SelectAndFormatTests(unittest.TestCase):
     def test_format_post(self):
         post = format_post("My *Blog*", FeedItem("k", "  A\n  __title__ ", "https://x.com/p?utm_source=rss&id=1", None))
         self.assertEqual(post, "My \\*Blog\\* - A \\_\\_title\\_\\_\nhttps://x.com/p?id=1")
-        self.assertTrue(format_post("", item("t"), role_id="42").startswith("<@&42> t\n"))
+        self.assertTrue(format_post("", item("t"), author_id="7").startswith("t · by <@7>\n"))
         self.assertLessEqual(len(format_post("F", FeedItem("k", "x" * 5000, "https://x.com/" + "y" * 3000, None))), 2000)
 
     def test_word_filters(self):

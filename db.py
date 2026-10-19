@@ -69,7 +69,7 @@ async def init_db():
                 channel_id TEXT NOT NULL,
                 url TEXT NOT NULL,
                 title TEXT,
-                role_id TEXT,
+                role_id TEXT,                             -- unused: feeds no longer ping a role
                 added_by TEXT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 etag TEXT,
@@ -595,14 +595,13 @@ async def cleanup_rss_activity(days: int = 30) -> int:
 # RSS/Atom feeds (/feed)
 # ──────────────────────────────────────────────
 
-async def add_feed(guild_id: str, channel_id: str, url: str, title: str,
-                   role_id: str | None, added_by: str) -> int:
+async def add_feed(guild_id: str, channel_id: str, url: str, title: str, added_by: str) -> int:
     """Insert a feed. Raises sqlite3.IntegrityError if the URL already posts to that channel."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO feeds (guild_id, channel_id, url, title, role_id, added_by)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (guild_id, channel_id, url, title, role_id, added_by)
+            """INSERT INTO feeds (guild_id, channel_id, url, title, added_by)
+               VALUES (?, ?, ?, ?, ?)""",
+            (guild_id, channel_id, url, title, added_by)
         )
         await db.commit()
         return cursor.lastrowid
@@ -690,7 +689,7 @@ async def record_feed_check(feed_id: int, error: str | None, etag: str | None = 
         return row[0] if row else 0
 
 
-FEED_SETTINGS = ("channel_id", "role_id", "include_words", "exclude_words",
+FEED_SETTINGS = ("channel_id", "include_words", "exclude_words",
                  "highlight_words", "summary_after", "author_id", "activity_exempt", "display_name")
 
 

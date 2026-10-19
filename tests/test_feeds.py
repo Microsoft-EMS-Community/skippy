@@ -82,7 +82,7 @@ class FakeChannel:
 
 
 class FeedTestCase(unittest.IsolatedAsyncioTestCase):
-    """A fresh database with one feed (#1, role 42) and a fake channel."""
+    """A fresh database with one feed (#1) and a fake channel."""
 
     async def asyncSetUp(self):
         if os.path.exists(os.environ["SKIPPY_DB_PATH"]):
@@ -96,7 +96,7 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
         bot.user = mock.Mock(id=SKIPPY_ID)
         self.cog.skip_until = {}
         self.cog.refusals_told = {}
-        self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/feed", "Blog", "42", "9")
+        self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/feed", "Blog", "9")
         await db.mark_feed_items_seen(self.feed_id, ["a", "b"])  # what /feed add does
 
     async def check(self, result):
@@ -111,15 +111,14 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class FeedPollTests(FeedTestCase):
-    async def test_only_new_items_post_oldest_first_with_role_ping(self):
+    async def test_only_new_items_post_oldest_first_pinging_nobody(self):
         await self.check(rss("a", "b"))
         self.assertEqual(self.posted(), [])
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])
         content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("<@&42> Blog - Post c\n"))
-        self.assertEqual([r.id for r in mentions.roles], [42])
-        self.assertFalse(mentions.everyone)
+        self.assertTrue(content.startswith("Blog - Post c\n"))
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)  # no author to credit
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])  # nothing posts twice
 
@@ -128,10 +127,10 @@ class FeedPollTests(FeedTestCase):
         await self.check(rss(*keys))
         self.assertEqual(len(self.channel.sent), 1)
         summary, mentions = self.channel.sent[0]
-        self.assertTrue(summary.startswith("<@&42> Blog - 8 new posts:"))
+        self.assertTrue(summary.startswith("Blog - 8 new posts:"))
         self.assertEqual([line.split("](<")[1][:-2] for line in summary.splitlines()[1:]],
                          [f"https://example.com/n{i}" for i in range(1, 9)])  # oldest first, all 8
-        self.assertEqual([r.id for r in mentions.roles], [42])
+        self.assertFalse(mentions.users or mentions.roles or mentions.everyone)
         await self.check(rss(*keys))
         self.assertEqual(len(self.channel.sent), 1)  # not repeated
 
@@ -149,7 +148,7 @@ class FeedPollTests(FeedTestCase):
         result = FetchResult(f"<rss><channel><title>MSRC</title>{items}</channel></rss>".encode(), None, None)
         await self.check(result)
         lines = self.channel.sent[0][0].splitlines()
-        self.assertEqual(lines[0], "<@&42> MSRC - 2 new posts:")
+        self.assertEqual(lines[0], "MSRC - 2 new posts:")
         self.assertIn("**CVE-2 Remote Code Execution**", lines[1])  # highlighted, first
         self.assertIn("CVE-3 Information Disclosure", lines[2])
         self.assertTrue(all("Chromium" not in line for line in lines))
@@ -227,7 +226,7 @@ class CommunityTests(FeedTestCase):
         await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
         await self.check(rss("c", "a", "b"))
         content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("<@&42> Blog - Post c · by <@77>\n"))
+        self.assertTrue(content.startswith("Blog - Post c · by <@77>\n"))
         self.assertEqual([u.id for u in mentions.users], [77])
 
     async def test_linking_an_author_watches_them_without_resetting_history(self):
@@ -260,7 +259,7 @@ class CommunityTests(FeedTestCase):
         await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(len(self.channel.sent), 1)
         content, mentions = self.channel.sent[0]
-        self.assertTrue(content.startswith("<@&42> Blog - Post new · by <@77>\n"))  # looks like a normal post ...
+        self.assertTrue(content.startswith("Blog - Post new · by <@77>\n"))  # looks like a normal post ...
         self.assertFalse(mentions.users or mentions.roles or mentions.everyone)   # ... but pings nobody
         self.assertEqual([r["title"] for r in await db.search_feed_posts(["new"])], ["Post new"])
         self.assertIn("Posted its newest item", i.followup.send.await_args.args[0])
@@ -426,7 +425,7 @@ class RoundupTests(FeedTestCase):
         self.assertRegex(embed.description, r"…and \d+ more posts\.$")
 
     async def test_query_is_this_channels_feeds_last_seven_days(self):
-        other = await db.add_feed("1", "222", "https://other.example/feed", "Other", None, "9")
+        other = await db.add_feed("1", "222", "https://other.example/feed", "Other", "9")
         await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None),
                                      (self.feed_id, "Blog", "Stale", "https://e.com/s", None),
                                      (other, "Other", "Elsewhere", "https://e.com/x", None)])
@@ -496,7 +495,7 @@ class FeedNameTests(FeedTestCase):
     async def test_display_name_replaces_the_feeds_own_title(self):
         await db.update_feed(self.feed_id, "1", display_name="CirriusTech")
         await self.check(rss("c", "a", "b"))
-        self.assertTrue(self.channel.sent[0][0].startswith("<@&42> CirriusTech - Post c\n"))
+        self.assertTrue(self.channel.sent[0][0].startswith("CirriusTech - Post c\n"))
         self.assertEqual((await db.search_feed_posts(["post", "c"]))[0]["feed_title"], "CirriusTech")
         feed = await db.get_feed(self.feed_id, "1")
         self.assertEqual(feeds.feed_name(feed), "CirriusTech")
@@ -508,7 +507,7 @@ class FeedNameTests(FeedTestCase):
         await feeds.FeedCommands.feed_add.callback(self.cog, interaction(), "<\u200bcirriustech.co.uk/blog/index.xml>",
                                                    name="CirriusTech")
         self.assertEqual(self.cog._create_feed.await_args.args[1], "https://cirriustech.co.uk/blog/index.xml")
-        self.assertTrue(self.channel.sent[0][0].startswith("<@&42> CirriusTech - Post new\n"))
+        self.assertTrue(self.channel.sent[0][0].startswith("CirriusTech - Post new\n"))
 
     async def test_edit_sets_and_clears_the_name(self):
         i = interaction()
@@ -861,7 +860,7 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         self.cog._dm = mock.AsyncMock()
         self.sid = await db.add_suggestion("1", "https://blog.example/feed", "My Blog", "300", "300", None)
         self.channel = FakeChannel()
-        self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://blog.example/feed", "My Blog", None, "500")
+        self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://blog.example/feed", "My Blog", "500")
         _, items = feed_reader.parse_feed(rss("latest", "older").data)
         self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "My Blog", items, self.channel))
 
@@ -869,7 +868,7 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         i = interaction()
         await self.cog.approve_suggestion(i, self.sid)
         self.cog._create_feed.assert_awaited_once_with(i.guild, "https://blog.example/feed",
-                                                       feeds.DEFAULT_CHANNEL_ID, None, "300", "500")
+                                                       feeds.DEFAULT_CHANNEL_ID, "300", "500")
         suggestion = await db.get_suggestion(self.sid)
         self.assertEqual((suggestion["status"], suggestion["decided_by"]), ("approved", "500"))
         card = i.message.edit.await_args.kwargs
@@ -882,7 +881,7 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
     async def test_another_members_blog_credits_them_and_tells_both(self):
         sid = await db.add_suggestion("1", "https://other.example/feed", "Other", "300", "301", None)
         await self.cog.approve_suggestion(interaction(), sid)
-        self.assertEqual(self.cog._create_feed.await_args.args[4], "301")
+        self.assertEqual(self.cog._create_feed.await_args.args[3], "301")
         told = {call.args[0]: call.args[1] for call in self.cog._dm.await_args_list}
         self.assertIn("crediting <@301>", told["300"])
         self.assertIn("suggested by <@300>", told["301"])
