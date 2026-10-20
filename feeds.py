@@ -1191,6 +1191,8 @@ class FeedCommands(commands.Cog):
         shown = " · ".join(f"[{label}](<{links[site]}>)" for site, label in profile_links.SITES.items()
                            if (links or {}).get(site))
         author = f"<@{feed['author_id']}>" if feed["author_id"] else none
+        checked = (f"<t:{int(datetime.fromisoformat(feed['last_checked']).replace(tzinfo=timezone.utc).timestamp())}:R>"
+                   if feed["last_checked"] else "not yet")  # shows as "2 minutes ago", in the viewer's own time
         return "\n".join([
             f"**{discord.utils.escape_markdown(feed_name(feed))}** <{feed['url']}>"
             + (f" (the feed calls itself \"{discord.utils.escape_markdown(feed['title'])}\")"
@@ -1204,6 +1206,7 @@ class FeedCommands(commands.Cog):
             f"Summary when more than {feed['summary_after']} new posts at once",
             f"Activity rule: {'exempt' if feed['activity_exempt'] else 'applies' if feed['author_id'] else 'n/a (no author)'}",
             f"Status: {'⚠️ failing: ' + feed['last_error'] if feed['failures'] else '✅ working'}",
+            f"Last checked: {checked}",
         ])
 
     async def _record_success(self, feed: dict, result=None, title: str | None = None):
