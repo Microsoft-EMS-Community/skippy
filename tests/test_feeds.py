@@ -6,9 +6,11 @@
 
 import asyncio
 import os
+import re
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -540,6 +542,13 @@ class FeedNameTests(FeedTestCase):
         feed = await db.get_feed(self.feed_id, "1")
         self.assertEqual(feeds.feed_name(feed), "CirriusTech")
         self.assertIn('calls itself "Blog"', feeds.FeedCommands._describe(feed))
+
+    async def test_settings_show_when_the_feed_was_last_checked(self):
+        self.assertIn("Last checked: not yet", feeds.FeedCommands._describe(await db.get_feed(self.feed_id, "1")))
+        await self.check(rss("a"))
+        shown = feeds.FeedCommands._describe(await db.get_feed(self.feed_id, "1"))
+        when = int(re.search(r"Last checked: <t:(\d+):R>", shown).group(1))
+        self.assertLess(abs(when - time.time()), 60)
 
     async def test_add_takes_a_name_and_a_messy_url(self):
         _, items = feed_reader.parse_feed(rss("new").data)
