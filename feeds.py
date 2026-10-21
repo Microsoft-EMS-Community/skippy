@@ -396,6 +396,7 @@ class FeedCommands(commands.Cog):
     @feed.command(name="edit", description="Change a feed's settings. With only a feed picked, shows them.")
     @app_commands.describe(
         feed="The feed to change",
+        url="Its new RSS or Atom address, if the blog moved",
         channel="Move it to another feed channel",
         author="The member who writes it: credited on posts, and activity-tracked",
         name="What posts call it, instead of the feed's own title",
@@ -408,7 +409,8 @@ class FeedCommands(commands.Cog):
         **{site: f"The author's {text}" for site, text in LINK_OPTIONS.items()})
     @app_commands.choices(channel=CHANNEL_CHOICES, clear=CLEARABLE_SETTINGS)
     @is_rss_admin()
-    async def feed_edit(self, interaction: discord.Interaction, feed: int, channel: str | None = None,
+    async def feed_edit(self, interaction: discord.Interaction, feed: int, url: str | None = None,
+                        channel: str | None = None,
                         author: discord.Member | None = None,
                         name: app_commands.Range[str, 1, 80] | None = None,
                         include: str | None = None, exclude: str | None = None,
@@ -417,43 +419,44 @@ class FeedCommands(commands.Cog):
                         activity_exempt: bool | None = None, clear: str | None = None,
                         linkedin: str | None = None, x: str | None = None, youtube: str | None = None,
                         github: str | None = None):
+        if url:  # fetching the new address can take longer than Discord waits for a reply
+            await interaction.response.defer(ephemeral=True)
+        send = interaction.followup.send if url else interaction.response.send_message
         guild_id = str(interaction.guild_id)
         current = await db.get_feed(feed, guild_id)
         if not current:
-            await interaction.response.send_message(f"There's no feed #{feed}.", ephemeral=True)
+            await send(f"There's no feed #{feed}.", ephemeral=True)
             return
         # Profile links belong to the feed's author, so they need one.
         try:
             links = read_links(linkedin=linkedin, x=x, youtube=youtube, github=github)
         except ValueError as e:
-            await interaction.response.send_message(f"Couldn't change that: {e}.", ephemeral=True)
+            await send(f"Couldn't change that: {e}.", ephemeral=True)
             return
         if clear and clear.startswith("link:"):
             links[clear.removeprefix("link:")] = None
             clear = None
         links_of = str(author.id) if author else current["author_id"]
         if links and not links_of:
-            await interaction.response.send_message(
-                "Profile links belong to the blog's author, and this feed has none; set `author` too.", ephemeral=True)
+            await send("Profile links belong to the blog's author, and this feed has none; set `author` too.",
+                       ephemeral=True)
             return
         if author and (blog := await self._feed_by_author(guild_id, str(author.id), ignore_feed=feed)):
-            await interaction.response.send_message(
-                f"{author.mention} already has a blog on the feed: feed #{blog['id']} **{self._name(blog)}**. "
-                f"Each member has one; to swap, clear that feed's author first "
-                f"(`/feed edit feed:{blog['id']} clear:author`).", ephemeral=True)
+            await send(f"{author.mention} already has a blog on the feed: feed #{blog['id']} **{self._name(blog)}**. "
+                       f"Each member has one; to swap, clear that feed's author first "
+                       f"(`/feed edit feed:{blog['id']} clear:author`).", ephemeral=True)
             return
         changes = {}
         if channel:
             if int(channel) not in FEED_CHANNELS.values():
-                await interaction.response.send_message("That isn't one of the feed channels.", ephemeral=True)
+                await send("That isn't one of the feed channels.", ephemeral=True)
                 return
             row = await db.get_feed(feed, guild_id)
             duplicate = await self._duplicate_of(guild_id, row["url"], await db.feed_item_ids(feed), int(channel),
                                                  ignore_feed=feed)
             if duplicate:
-                await interaction.response.send_message(
-                    f"Feed #{duplicate['id']} **{self._name(duplicate)}** already posts that blog in <#{channel}>.",
-                    ephemeral=True)
+                await send(f"Feed #{duplicate['id']} **{self._name(duplicate)}** already posts that blog in <#{channel}>.",
+                           ephemeral=True)
                 return
             changes["channel_id"] = channel
         if name and name.strip():
@@ -462,6 +465,22 @@ class FeedCommands(commands.Cog):
                                ("highlight_words", highlight)):
             if value is not None:
                 changes[setting] = ", ".join(feed_reader.word_list(value)) or None
+        if url:
+            url = feed_reader.normalize_url(url)
+            try:
+                async with feed_reader.session() as http:
+                    result = await feed_reader.fetch_feed(http, url)
+                    title, items = feed_reader.parse_feed(result.data, url)
+            except FeedError as e:
+                await send(f"Couldn't change the address: {e}.", ephemeral=True)
+                return
+            target = int(changes.get("channel_id") or current["channel_id"])
+            duplicate = await self._duplicate_of(guild_id, url, feed_reader.item_ids(items), target, ignore_feed=feed)
+            if duplicate:
+                await send(f"That's the same blog as feed #{duplicate['id']} **{self._name(duplicate)}**, "
+                           f"which already posts in <#{target}>.", ephemeral=True)
+                return
+            changes["url"] = url
         if summary_after:
             changes["summary_after"] = summary_after
         if activity_exempt is not None:
@@ -471,8 +490,13 @@ class FeedCommands(commands.Cog):
         try:
             await db.update_feed(feed, guild_id, **changes)
         except sqlite3.IntegrityError:
-            await interaction.response.send_message("That feed already posts in that channel.", ephemeral=True)
+            await send("That feed already posts in that channel.", ephemeral=True)
             return
+        if url:
+            # What's at the new address counts as seen, like when a feed is
+            # added, so moving a blog doesn't repost its history.
+            await db.mark_feed_items_seen(feed, [i.key for i in items])
+            await self._record_success(current, result, title)  # tells the mods if it was failing
         if author:
             await self._link_author(feed, guild_id, str(author.id), str(interaction.user.id))
             changes["author_id"] = str(author.id)
@@ -482,10 +506,9 @@ class FeedCommands(commands.Cog):
         row = await db.get_feed(feed, guild_id)
         verb = "Updated" if changes else "Settings for"
         shown_links = await db.get_author_links(row["author_id"]) if row["author_id"] else {}
-        await interaction.response.send_message(f"{verb} feed #{feed}:\n{self._describe(row, shown_links)}",
-                                                ephemeral=True)
+        await send(f"{verb} feed #{feed}:\n{self._describe(row, shown_links)}", ephemeral=True)
         if changes:
-            labels = {"channel_id": "channel", "author_id": "author", "display_name": "name",
+            labels = {"url": "address", "channel_id": "channel", "author_id": "author", "display_name": "name",
                       "include_words": "include words", "exclude_words": "exclude words",
                       "highlight_words": "highlight words", "summary_after": "summary threshold",
                       "activity_exempt": "activity exemption", "links": "profile links"}

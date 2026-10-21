@@ -689,7 +689,7 @@ async def record_feed_check(feed_id: int, error: str | None, etag: str | None = 
         return row[0] if row else 0
 
 
-FEED_SETTINGS = ("channel_id", "include_words", "exclude_words",
+FEED_SETTINGS = ("url", "channel_id", "include_words", "exclude_words",
                  "highlight_words", "summary_after", "author_id", "activity_exempt", "display_name")
 
 
@@ -701,6 +701,8 @@ async def update_feed(feed_id: int, guild_id: str, **settings) -> bool:
         raise ValueError(f"not feed settings: {unknown}")
     if not settings:
         return await get_feed(feed_id, guild_id) is not None
+    if "url" in settings:  # the old address's caching headers mean nothing to the new one
+        settings = {**settings, "etag": None, "last_modified": None}
     assignments = ", ".join(f"{name} = ?" for name in settings)
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
