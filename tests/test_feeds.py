@@ -566,6 +566,45 @@ class FeedNameTests(FeedTestCase):
         self.assertEqual(feeds.feed_name(await db.get_feed(self.feed_id, "1")), "Blog")
 
 
+class FeedAddressTests(FeedTestCase):
+    async def edit_url(self, url, result):
+        i = interaction()
+        fetch = mock.AsyncMock(side_effect=result) if isinstance(result, Exception) else mock.AsyncMock(return_value=result)
+        with mock.patch.object(feed_reader, "fetch_feed", fetch):
+            await feeds.FeedCommands.feed_edit.callback(self.cog, i, self.feed_id, url=url)
+        i.response.defer.assert_awaited()  # fetching can outlast Discord's 3 seconds
+        return i.followup.send.await_args.args[0]
+
+    async def test_a_moved_blog_keeps_its_settings_and_reposts_nothing(self):
+        await db.update_feed(self.feed_id, "1", display_name="Joey", exclude_words="draft")
+        await db.record_feed_check(self.feed_id, None, '"old-etag"', "Mon, 19 Oct 2026 10:00:00 GMT")
+        for _ in range(feeds.ALERT_AFTER_FAILURES):
+            await db.record_feed_check(self.feed_id, "HTTP 404")
+        shown = await self.edit_url(" www.example.com/rss.xml ", rss("c", "a", "b"))
+        self.assertIn("Updated feed #1", shown)
+        self.assertIn("https://www.example.com/rss.xml", shown)
+        feed = await db.get_feed(self.feed_id, "1")
+        self.assertEqual((feed["url"], feed["display_name"], feed["exclude_words"]),
+                         ("https://www.example.com/rss.xml", "Joey", "draft"))
+        self.assertEqual((feed["etag"], feed["last_modified"], feed["failures"]), (None, None, 0))
+        self.assertIn("is working again", self.alerts.sent[0][0])
+        self.assertIn("edited feed #1 **Joey**: address", self.alerts.sent[1][0])
+        await self.check(rss("d", "c", "a", "b"))
+        self.assertEqual(self.posted(), ["d"])  # c was already there when it moved
+
+    async def test_an_address_that_isnt_a_working_feed_changes_nothing(self):
+        shown = await self.edit_url("https://example.com/gone", FeedError("HTTP 404"))
+        self.assertEqual(shown, "Couldn't change the address: HTTP 404.")
+        self.assertEqual((await db.get_feed(self.feed_id, "1"))["url"], "https://example.com/feed")
+
+    async def test_moving_onto_another_feeds_blog_is_refused(self):
+        other = await db.add_feed("1", str(CHANNEL_ID), "https://other.example/feed", "Other", "9")
+        await db.mark_feed_items_seen(other, ["x", "y"])
+        shown = await self.edit_url("https://other.example/rss", rss("x", "y"))
+        self.assertIn(f"same blog as feed #{other} **Other**", shown)
+        self.assertEqual((await db.get_feed(self.feed_id, "1"))["url"], "https://example.com/feed")
+
+
 class FeedCommandTestCase(FeedTestCase):
     """Runs /feed add, /blog suggest and approvals for real, with feed
     channels CHANNEL_ID (the community channel) and 222."""
