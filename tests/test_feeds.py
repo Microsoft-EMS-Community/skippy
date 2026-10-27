@@ -137,13 +137,35 @@ class FeedPollTests(FeedTestCase):
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])  # nothing posts twice
 
+    async def test_a_blog_whose_links_all_changed_reposts_nothing(self):
+        await self.check(rss("c", "a", "b"))
+        self.assertEqual(self.posted(), ["c"])
+        await self.check(rss("c2", "a2", "b2"))  # the same posts, rebuilt under another address
+        self.assertEqual(self.posted(), ["c"])
+        self.assertIn("all 3 posts in it have new links now (like <https://example.com/c2>)", self.alerts.sent[0][0])
+        self.assertIn("`/feed test feed:1`", self.alerts.sent[0][0])
+        await self.check(rss("d2", "c2", "a2", "b2"))
+        self.assertEqual(self.posted(), ["c", "d2"])  # after the move, new posts post again
+
+    async def test_small_feeds_can_be_all_new(self):
+        await self.check(rss("c"))  # a feed listing only its latest post
+        await self.check(rss("d"))
+        await self.check(rss("f", "e"))
+        self.assertEqual(self.posted(), ["c", "d", "e", "f"])
+        self.assertEqual(self.alerts.sent, [])
+
+    async def test_a_feed_with_nothing_seen_yet_posts_everything(self):
+        self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/new-blog", "Blog", "9")
+        await self.check(rss("c", "b", "a"))  # added while empty: these are its first posts
+        self.assertEqual(self.posted(), ["a", "b", "c"])
+
     async def test_links_without_the_sites_address_still_post(self):
         hugo = b"<rss><channel><title>Blog</title><item><title>Post r</title><link>/2026/r/</link></item></channel></rss>"
         await self.check(FetchResult(hugo, None, None))
         self.assertEqual(self.channel.sent[0][0].url, "https://example.com/2026/r/")  # read against the feed's address
 
     async def test_burst_becomes_one_summary_with_nothing_dropped(self):
-        keys = [f"n{i}" for i in range(8, 0, -1)]  # n8 newest ... n1 oldest
+        keys = [f"n{i}" for i in range(8, 0, -1)] + ["a", "b"]  # n8 newest ... n1 oldest, then the seen ones
         await self.check(rss(*keys))
         self.assertEqual(len(self.channel.sent), 1)
         summary, mentions = self.channel.sent[0]
@@ -156,7 +178,7 @@ class FeedPollTests(FeedTestCase):
 
     async def test_summary_threshold_is_per_feed(self):
         await db.update_feed(self.feed_id, "1", summary_after=10)
-        await self.check(rss(*[f"n{i}" for i in range(8, 0, -1)]))
+        await self.check(rss(*[f"n{i}" for i in range(8, 0, -1)], "a", "b"))
         self.assertEqual(len(self.channel.sent), 8)  # under the threshold: posted one by one
 
     async def test_filters_skip_for_good_and_highlight_orders_summary(self):
@@ -164,7 +186,7 @@ class FeedPollTests(FeedTestCase):
                              highlight_words="remote code execution")
         items = "".join(f"<item><title>{t}</title><link>https://e.com/{n}</link><guid>{n}</guid></item>"
                         for n, t in (("3", "Chromium CVE-1: Use after free"), ("2", "CVE-2 Remote Code Execution"),
-                                     ("1", "CVE-3 Information Disclosure")))
+                                     ("1", "CVE-3 Information Disclosure"), ("a", "CVE-0 Seen before")))
         result = FetchResult(f"<rss><channel><title>MSRC</title>{items}</channel></rss>".encode(), None, None)
         await self.check(result)
         lines = self.channel.sent[0][0].splitlines()
@@ -184,10 +206,10 @@ class FeedPollTests(FeedTestCase):
 
     async def test_failed_send_is_retried_next_check(self):
         self.channel.fail_on = {"d"}
-        await self.check(rss("e", "d", "c"))
+        await self.check(rss("e", "d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c"])
         self.channel.fail_on = set()
-        await self.check(rss("e", "d", "c"))
+        await self.check(rss("e", "d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d", "e"])
 
     async def test_alerts_once_after_repeated_failures_then_on_recovery(self):
@@ -883,7 +905,7 @@ class ConsistentPostsTests(FeedTestCase):
         self.assertIn("test-posted feed #1 **Blog**", self.alerts.sent[-1][0])  # mods see it
 
     async def test_summary_gets_a_thread_but_no_vote(self):
-        await self.check(rss(*[f"n{i}" for i in range(8, 0, -1)]))
+        await self.check(rss(*[f"n{i}" for i in range(8, 0, -1)], "a", "b"))
         self.assertEqual(len(self.channel.sent), 1)
         self.assertEqual(self.channel.votes_added, [])
         self.assertEqual(self.channel.threads, ["Blog - 8 new posts"])
