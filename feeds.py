@@ -31,6 +31,7 @@ logger = logging.getLogger("followup-bot")
 ALERT_AFTER_FAILURES = max(1, 60 // FEED_POLL_MINUTES)  # an hour of failed checks
 CONCURRENT_CHECKS = 5     # feeds checked at once, so slow or dead ones can't hold up the rest
 MAX_PENDING_SUGGESTIONS = 3  # per member, so nobody can flood the mods' queue
+MOVED_MIN_ITEMS = 3       # feeds this big are never all new at once (one listing only its latest post always is)
 REFUSAL_REPEAT_SECONDS = 3600  # a member retrying the same refused blog is reported to the mods once an hour
 THREAD_ARCHIVE_MINUTES = 4320  # discussion threads on posts go quiet after 3 days
 ACTIVITY_DAYS = 30        # activity window, and the grace period for newly linked authors
@@ -884,6 +885,9 @@ class FeedCommands(commands.Cog):
             return
 
         seen = await db.get_seen_feed_items(feed["id"])
+        if seen and len(items) >= MOVED_MIN_ITEMS and not any(i.key in seen for i in items):
+            await self._moved(feed, result, title, items)
+            return
         new = feed_reader.select_new(items, seen, len(items))
         include = feed_reader.word_list(feed["include_words"])
         exclude = feed_reader.word_list(feed["exclude_words"])
@@ -899,6 +903,19 @@ class FeedCommands(commands.Cog):
         if new:
             logger.info("Feed #%s: %d new, %d filtered out, %d posted",
                         feed["id"], len(new), len(new) - len(to_post), len(posted))
+
+    async def _moved(self, feed: dict, result, title: str, items: list):
+        """Every post in the feed looking new at once isn't a blog publishing
+        its whole history: its links changed (a new domain, or a site rebuilt
+        with another address), so they're the same posts. They count as seen
+        and nothing posts; the mods hear why, in case one really is new."""
+        await db.mark_feed_items_seen(feed["id"], [i.key for i in items])
+        await self._record_success(feed, result, title)
+        logger.warning("Feed #%s: all %d posts have new links; taken as moved, none posted", feed["id"], len(items))
+        example = next((f" (like <{i.link}>)" for i in items if i.link), "")
+        await self._alert(f"🔀 Feed `#{feed['id']}` **{self._name(feed)}**: all {len(items)} posts in it have new links "
+                          f"now{example}, so I took it that the blog moved and reposted none of them. If the newest "
+                          f"one really is new, `/feed test feed:{feed['id']}` posts it.")
 
     # ──────────────────────────────────────────
     # Weekly roundup: Mondays 09:00 in the roundup channel
