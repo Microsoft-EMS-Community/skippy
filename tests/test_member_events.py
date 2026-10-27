@@ -5,6 +5,7 @@
 # objects faked (discord_fakes.py) and a throwaway database.
 
 import asyncio
+import importlib
 import os
 import sys
 import tempfile
@@ -26,14 +27,13 @@ from discord_fakes import SKIPPY, FakeGuild, button_click, reaction  # noqa: E40
 
 
 async def skippy_bot():
-    """Skippy with all its event handling, not connected to Discord."""
+    """Skippy with every feature loaded, as in production, but not connected to Discord."""
     import bot as skippy
-    for state in (skippy.nudge_cooldowns, skippy.new_account_nudge_cooldowns, skippy.pending_verification_notices,
-                  skippy.verify_prompt_sent_at, skippy.account_audit_cards):
-        state.clear()
-    skippy.recent_joins.clear()
-    await skippy.bot._async_setup_hook()
-    return skippy.bot
+    bot = skippy.Skippy()
+    await bot._async_setup_hook()
+    for extension in skippy.EXTENSIONS:
+        await importlib.import_module(extension).setup(bot)
+    return bot
 
 
 class EventTestCase(unittest.IsolatedAsyncioTestCase):
@@ -251,9 +251,8 @@ class NewAccountTests(EventTestCase):
         self.assertIsInstance(message.replies[0].view, views.VerifyHumanView)
 
     async def verify(self, member, button="verify_human", after_seconds=5.0):
-        import bot as skippy
         await self.event("message", self.guild.general.post(member, "hi"))
-        skippy.verify_prompt_sent_at[str(member.id)] -= timedelta(seconds=after_seconds)
+        self.bot.get_cog("NewAccounts").prompt_sent_at[str(member.id)] -= timedelta(seconds=after_seconds)
         click = button_click(member, f"followup:{button}:{member.id}", member.dms[0])
         await self.event("interaction", click)
         return click

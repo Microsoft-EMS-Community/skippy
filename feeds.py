@@ -20,7 +20,7 @@ from discord.ext import commands, tasks
 import db
 import feed_reader
 import profile_links
-from commands import is_rss_admin
+from checks import is_rss_admin
 from config import (FEED_ALERT_CHANNEL_ID, FEED_CHANNELS, FEED_COMMUNITY_CHANNEL_ID, FEED_POLL_MINUTES,
                     FEED_ROUNDUP_CHANNEL_ID, FEED_ROUNDUP_TIMEZONE, FEED_SUGGESTIONS_CHANNEL_ID,
                     FEED_LINK_EMOJIS, FEED_THREAD_CHANNEL_IDS, FEED_VOTE_EMOJI, RSS_ADMIN_ROLE_ID)
