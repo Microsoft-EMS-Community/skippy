@@ -11,7 +11,7 @@ import sys
 import tempfile
 import traceback
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 

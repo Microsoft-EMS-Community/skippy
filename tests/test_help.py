@@ -81,9 +81,10 @@ class HelpTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"<#{channel}>", text(mod_guide))
 
     async def test_guide_lists_every_slash_command_the_bot_has(self):
+        import blog
         import feeds
         groups = {"rsswatch": rss_watch.RssWatch.rsswatch, "feed": feeds.FeedCommands.feed,
-                  "blog": feeds.FeedCommands.blog}
+                  "blog": blog.BlogCommands.blog}
         names = [c.name for cog in (followup_commands.FollowUpCommands, fun.FunCommands)
                  for c in cog.__cog_app_commands__]
         names += [f"{g} {c.name}" for g, group in groups.items() for c in group.commands]

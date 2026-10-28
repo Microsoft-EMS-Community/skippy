@@ -26,10 +26,17 @@ import discord  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import db  # noqa: E402
 import feed_reader  # noqa: E402
+import blog  # noqa: E402
+import feed_activity  # noqa: E402
+import feed_notices  # noqa: E402
+import feed_poller  # noqa: E402
+import feed_posting  # noqa: E402
+import feed_registry  # noqa: E402
+import feed_roundup  # noqa: E402
 import feeds  # noqa: E402
 from feed_reader import FeedError, FetchResult  # noqa: E402
 
-CHANNEL_ID, ALERT_CHANNEL_ID = 111, feeds.FEED_ALERT_CHANNEL_ID
+CHANNEL_ID, ALERT_CHANNEL_ID = 111, feed_notices.FEED_ALERT_CHANNEL_ID
 GENERAL_ID = 333  # where the roundup goes
 
 
@@ -41,6 +48,17 @@ def rss(*keys):
 
 
 SKIPPY_ID = 1473839815643369686
+
+
+# Every module behind /feed and /blog, for settings a test changes everywhere.
+FEED_MODULES = (feeds, blog, feed_activity, feed_notices, feed_poller, feed_posting, feed_registry, feed_roundup)
+
+
+def start_patch(test, target, name, new=mock.DEFAULT):
+    """mock.patch.object for the rest of the test; returns the patched-in object."""
+    patcher = mock.patch.object(target, name, mock.AsyncMock() if new is mock.DEFAULT else new)
+    test.addCleanup(patcher.stop)
+    return patcher.start()
 
 
 def setUpModule():
@@ -103,13 +121,14 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
             os.remove(os.environ["SKIPPY_DB_PATH"])
         await db.init_db()
         self.channel, self.alerts = FakeChannel(), FakeChannel()
-        bot = mock.Mock()
+        self.bot = bot = mock.Mock()
         bot.get_channel = lambda cid: {CHANNEL_ID: self.channel, ALERT_CHANNEL_ID: self.alerts}.get(cid)
-        self.cog = feeds.FeedCommands.__new__(feeds.FeedCommands)  # skip __init__: no poll loop
-        self.cog.bot = bot
         bot.user = mock.Mock(id=SKIPPY_ID)
-        self.cog.skip_until = {}
-        self.cog.refusals_told = {}
+        self.cog, self.blog = feeds.FeedCommands(bot), blog.BlogCommands(bot)
+        self.poller = feed_poller.FeedPoller.__new__(feed_poller.FeedPoller)  # skip __init__: no poll loop
+        self.poller.bot, self.poller.skip_until = bot, {}
+        self.roundup = feed_roundup.WeeklyRoundup.__new__(feed_roundup.WeeklyRoundup)  # no loop either
+        self.roundup.bot = bot
         self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://example.com/feed", "Blog", "9")
         await db.mark_feed_items_seen(self.feed_id, ["a", "b"])  # what /feed add does
 
@@ -117,8 +136,17 @@ class FeedTestCase(unittest.IsolatedAsyncioTestCase):
         feed = await db.get_feed(self.feed_id, "1")
         fetch = mock.AsyncMock(side_effect=result) if isinstance(result, Exception) else mock.AsyncMock(return_value=result)
         with mock.patch.object(feed_reader, "fetch_feed", fetch):
-            await self.cog._check(mock.Mock(), feed)
+            await self.poller.check(mock.Mock(), feed)
         return fetch
+
+    def patch(self, target, name, new=mock.DEFAULT):
+        return start_patch(self, target, name, new)
+
+    def patch_setting(self, name, value):
+        """A config value for this test, in every feed module that uses it."""
+        for module in FEED_MODULES:
+            if hasattr(module, name):
+                self.patch(module, name, value)
 
     def posted(self):
         return [card.url.rsplit("/", 1)[1] for card, _ in self.channel.sent]
@@ -213,17 +241,17 @@ class FeedPollTests(FeedTestCase):
         self.assertEqual(self.posted(), ["c", "d", "e"])
 
     async def test_alerts_once_after_repeated_failures_then_on_recovery(self):
-        for _ in range(feeds.ALERT_AFTER_FAILURES + 2):
+        for _ in range(feed_poller.ALERT_AFTER_FAILURES + 2):
             await self.check(FeedError("HTTP 500"))
         self.assertEqual(len(self.alerts.sent), 1)
-        self.assertIn(f"failed {feeds.ALERT_AFTER_FAILURES} checks in a row: HTTP 500", self.alerts.sent[0][0])
+        self.assertIn(f"failed {feed_poller.ALERT_AFTER_FAILURES} checks in a row: HTTP 500", self.alerts.sent[0][0])
         await self.check(rss("a", "b"))
         self.assertEqual(len(self.alerts.sent), 2)
         self.assertIn("working again", self.alerts.sent[1][0])
         self.assertEqual((await db.get_feed(self.feed_id, "1"))["failures"], 0)
 
     async def test_missing_channel_counts_as_failure(self):
-        self.cog.bot.get_channel = lambda cid: None
+        self.bot.get_channel = lambda cid: None
         await self.check(rss("c"))
         feed = await db.get_feed(self.feed_id, "1")
         self.assertEqual((feed["failures"], feed["last_error"]), (1, "its channel no longer exists"))
@@ -238,7 +266,7 @@ class FeedPollTests(FeedTestCase):
         fetch = await self.check(rss("c", "a", "b"))
         fetch.assert_not_awaited()
         self.assertEqual(self.posted(), [])
-        self.cog.skip_until[self.feed_id] = 0  # wait over
+        self.poller.skip_until[self.feed_id] = 0  # wait over
         fetch = await self.check(rss("c", "a", "b"))
         fetch.assert_awaited_once()
         self.assertEqual(self.posted(), ["c"])
@@ -256,16 +284,16 @@ class FeedPollTests(FeedTestCase):
 
         many = [{"id": i} for i in range(12)]
         with mock.patch.object(db, "get_feeds", mock.AsyncMock(return_value=many)), \
-             mock.patch.object(self.cog, "_check", slow_check):
-            await feeds.FeedCommands.poll.coro(self.cog)
+             mock.patch.object(self.poller, "check", slow_check):
+            await feed_poller.FeedPoller.poll.coro(self.poller)
         self.assertEqual(sorted(checked), list(range(12)))
-        self.assertEqual(peak, feeds.CONCURRENT_CHECKS)
+        self.assertEqual(peak, feed_poller.CONCURRENT_CHECKS)
 
 
 class CommunityTests(FeedTestCase):
 
     async def test_author_is_credited_without_a_ping(self):
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
         await self.check(rss("c", "a", "b"))
         card, mentions = self.channel.sent[0]
         self.assertEqual(card.description, "by <@77>")
@@ -274,17 +302,17 @@ class CommunityTests(FeedTestCase):
     async def test_linking_an_author_watches_them_without_resetting_history(self):
         await db.add_to_watchlist("77", "1", "9")
         await db.log_rss_activity("77", "1", "5", "6", "https://discord.com/channels/1/5/6")
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "10")
+        await feed_registry.link_author(self.feed_id, "1", "77", "10")
         self.assertTrue(await db.is_watched("77"))
         self.assertEqual(await db.get_rss_activity_count("77"), 1)
         self.assertEqual((await db.get_feed(self.feed_id, "1"))["author_id"], "77")
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "88", "10")
+        await feed_registry.link_author(self.feed_id, "1", "88", "10")
         self.assertTrue(await db.is_watched("88"))
 
     async def test_threads_only_in_thread_channels_and_never_block_posting(self):
         await self.check(rss("c", "a", "b"))
         self.assertEqual(self.channel.threads, [])  # 111 isn't a thread channel
-        with mock.patch.object(feeds, "FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}):
+        with mock.patch.object(feed_posting, "FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}):
             await self.check(rss("d", "c", "a", "b"))
             self.assertEqual(self.channel.threads, ["Post d"])
             self.channel.thread_error = discord.HTTPException(mock.Mock(status=403, reason="no"), "Missing Permissions")
@@ -294,9 +322,9 @@ class CommunityTests(FeedTestCase):
 
 
     async def test_add_posts_the_newest_item(self):
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
         _, items = feed_reader.parse_feed(rss("new", "old").data)
-        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel))
+        self.create_feed = self.patch(feed_registry, "create_feed", mock.AsyncMock(return_value=(self.feed_id, "Blog", items, self.channel)))
         i = interaction()
         await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(len(self.channel.sent), 1)
@@ -307,7 +335,7 @@ class CommunityTests(FeedTestCase):
         self.assertIn("Posted its newest item", i.followup.send.await_args.args[0])
 
     async def test_add_of_an_empty_feed_posts_nothing(self):
-        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blog", [], self.channel))
+        self.create_feed = self.patch(feed_registry, "create_feed", mock.AsyncMock(return_value=(self.feed_id, "Blog", [], self.channel)))
         i = interaction()
         await feeds.FeedCommands.feed_add.callback(self.cog, i, "https://example.com/feed")
         self.assertEqual(self.channel.sent, [])
@@ -341,9 +369,9 @@ class ActivityRuleTests(FeedTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.cog._dm = mock.AsyncMock()
-        self.cog.bot.get_guild = lambda gid: mock.Mock(name="guild")
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        self.dm = self.patch(feed_notices, "dm")
+        self.bot.get_guild = lambda gid: mock.Mock(name="guild")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
         await self.age_watch("77", days=60)
 
     @staticmethod
@@ -361,7 +389,7 @@ class ActivityRuleTests(FeedTestCase):
                 await c.commit()
 
     async def test_status_new_active_inactive_untracked(self):
-        status = feeds.FeedCommands._author_status
+        status = feed_activity.author_status
         self.assertEqual(await status("77", 1), ("inactive", 0))
         await self.say_something()
         self.assertEqual(await status("77", 1), ("active", 1))
@@ -381,7 +409,7 @@ class ActivityRuleTests(FeedTestCase):
             await db.set_setting("feed_activity_mode", mode)
             await self.check(rss("c", "a", "b") if mode == "off" else rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["c", "d"])
-        self.assertEqual((self.alerts.sent, self.cog._dm.await_count), ([], 0))
+        self.assertEqual((self.alerts.sent, self.dm.await_count), ([], 0))
 
     async def test_warn_reminds_once_and_keeps_posting(self):
         await db.set_setting("feed_activity_mode", "warn")
@@ -390,7 +418,7 @@ class ActivityRuleTests(FeedTestCase):
         self.assertEqual(self.posted(), ["c", "d"])
         self.assertEqual(len(self.alerts.sent), 1)
         self.assertIn("friendly reminder", self.alerts.sent[0][0])
-        self.assertEqual(self.cog._dm.await_count, 1)
+        self.assertEqual(self.dm.await_count, 1)
 
     async def test_enforce_pauses_skips_and_resumes(self):
         await db.set_setting("feed_activity_mode", "enforce")
@@ -402,7 +430,7 @@ class ActivityRuleTests(FeedTestCase):
         await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(self.posted(), ["d"])
         self.assertIn("active again", self.alerts.sent[-1][0])
-        self.assertIn("Welcome back", self.cog._dm.await_args.args[1])
+        self.assertIn("Welcome back", self.dm.await_args.args[2])
         self.assertEqual(len(self.alerts.sent), 2)
 
     async def test_warned_then_enforced_gets_the_pause_message(self):
@@ -411,8 +439,8 @@ class ActivityRuleTests(FeedTestCase):
         await db.set_setting("feed_activity_mode", "enforce")
         await self.check(rss("c", "a", "b"))
         self.assertEqual(self.posted(), [])
-        self.assertEqual(self.cog._dm.await_count, 2)
-        self.assertIn("paused", self.cog._dm.await_args.args[1])
+        self.assertEqual(self.dm.await_count, 2)
+        self.assertIn("paused", self.dm.await_args.args[2])
 
     async def test_exempt_and_new_authors_are_left_alone(self):
         await db.set_setting("feed_activity_mode", "enforce")
@@ -427,7 +455,7 @@ class ActivityRuleTests(FeedTestCase):
     async def test_activity_command_sets_mode_and_lists_authors(self):
         i = interaction()
         await feeds.FeedCommands.feed_activity.callback(self.cog, i, mode="watch", min_messages=3)
-        self.assertEqual(await self.cog._activity_rule(), ("watch", 3))
+        self.assertEqual(await feed_activity.current_rule(), ("watch", 3))
         embed = i.response.send_message.await_args.kwargs["embed"]
         self.assertEqual(embed.title, "Activity rule: watch")
         self.assertIn("🔴 <@77> · 0 msg · Blog", embed.description)
@@ -438,7 +466,7 @@ def post(title, author_id=None, feed_id=1, feed_title="Blog"):
             "posted_at": "2026-10-15 10:00:00", "feed_id": feed_id, "author_id": author_id, "message_url": None}
 
 
-MONDAY_9 = datetime(2026, 10, 19, 9, 0, tzinfo=feeds.ROUNDUP_TZ)
+MONDAY_9 = datetime(2026, 10, 19, 9, 0, tzinfo=feed_roundup.ROUNDUP_TZ)
 
 
 class RoundupTests(FeedTestCase):
@@ -448,11 +476,9 @@ class RoundupTests(FeedTestCase):
         await super().asyncSetUp()
         for name, value in (("FEED_COMMUNITY_CHANNEL_ID", CHANNEL_ID), ("FEED_ROUNDUP_CHANNEL_ID", GENERAL_ID),
                             ("FEED_VOTE_EMOJI", "👍")):
-            patcher = mock.patch.object(feeds, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+            self.patch_setting(name, value)
         self.general = FakeChannel(GENERAL_ID)
-        self.cog.bot.get_channel = {CHANNEL_ID: self.channel, ALERT_CHANNEL_ID: self.alerts,
+        self.bot.get_channel = {CHANNEL_ID: self.channel, ALERT_CHANNEL_ID: self.alerts,
                                     GENERAL_ID: self.general}.get
 
     def test_build_groups_per_blogger_in_posting_order_with_a_vote_podium(self):
@@ -460,7 +486,7 @@ class RoundupTests(FeedTestCase):
         for n, p in enumerate(posts):
             p["message_url"] = f"https://discord.com/channels/1/{CHANNEL_ID}/{n}"
         votes = {posts[3]["message_url"]: 5, posts[1]["message_url"]: 2, posts[0]["message_url"]: 2}
-        embed = feeds.build_roundup(posts, MONDAY_9, votes)
+        embed = feed_roundup.build_roundup(posts, MONDAY_9, votes)
         self.assertEqual(embed.title, "📰 Community roundup · week 42")
         lines = embed.description.splitlines()
         self.assertEqual(lines[0], "**4 new posts from 3 bloggers** in <#111> this week. Thanks for writing! 💙")
@@ -474,17 +500,17 @@ class RoundupTests(FeedTestCase):
         self.assertIn("/blog suggest", embed.footer.text)
 
     def test_no_votes_no_podium(self):
-        embed = feeds.build_roundup([post("A1", "77"), post("C1", "99", 3)], MONDAY_9, {})
+        embed = feed_roundup.build_roundup([post("A1", "77"), post("C1", "99", 3)], MONDAY_9, {})
         self.assertEqual(embed.fields, [])
 
     def test_build_quiet_week_and_single_blogger(self):
-        self.assertIsNone(feeds.build_roundup([], MONDAY_9))
-        embed = feeds.build_roundup([post("Only", "77")], MONDAY_9)
+        self.assertIsNone(feed_roundup.build_roundup([], MONDAY_9))
+        embed = feed_roundup.build_roundup([post("Only", "77")], MONDAY_9)
         self.assertTrue(embed.description.startswith("**1 new post from 1 blogger**"))
 
     def test_build_stays_within_discord_limits(self):
         many = [post(f"Post number {n} " + "x" * 100, str(1000 + n % 30), n) for n in range(200)]
-        embed = feeds.build_roundup(many, MONDAY_9)
+        embed = feed_roundup.build_roundup(many, MONDAY_9)
         self.assertLessEqual(len(embed.description), 4096)
         self.assertRegex(embed.description, r"…and \d+ more posts\.$")
 
@@ -500,30 +526,30 @@ class RoundupTests(FeedTestCase):
 
     async def test_posts_monday_from_nine_once_per_week(self):
         await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
-        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 - timedelta(minutes=1)))
-        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=1)))  # Tuesday
-        self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(minutes=3)))
-        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(hours=2)))  # already out
+        self.assertFalse(await self.roundup.maybe_post(MONDAY_9 - timedelta(minutes=1)))
+        self.assertFalse(await self.roundup.maybe_post(MONDAY_9 + timedelta(days=1)))  # Tuesday
+        self.assertTrue(await self.roundup.maybe_post(MONDAY_9 + timedelta(minutes=3)))
+        self.assertFalse(await self.roundup.maybe_post(MONDAY_9 + timedelta(hours=2)))  # already out
         self.assertEqual(len(self.general.embeds), 1)
         self.assertEqual(self.channel.embeds, [])  # in #general, not in the feed channel
-        self.assertTrue(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))  # next week
+        self.assertTrue(await self.roundup.maybe_post(MONDAY_9 + timedelta(days=7)))  # next week
 
     async def test_switched_off_or_quiet_posts_nothing(self):
-        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9))  # quiet week
+        self.assertFalse(await self.roundup.maybe_post(MONDAY_9))  # quiet week
         await db.archive_feed_posts([(self.feed_id, "Blog", "Fresh", "https://e.com/f", None)])
         await db.set_setting("feed_roundup", "off")
-        self.assertFalse(await self.cog._maybe_post_roundup(MONDAY_9 + timedelta(days=7)))
+        self.assertFalse(await self.roundup.maybe_post(MONDAY_9 + timedelta(days=7)))
         self.assertEqual(self.general.embeds, [])
 
     async def test_posts_in_the_community_channel_get_the_vote_emoji(self):
         await self.check(rss("c", "a", "b"))
         self.assertEqual(self.channel.votes_added, [(1, "👍")])
-        with mock.patch.object(feeds, "FEED_COMMUNITY_CHANNEL_ID", 222):  # any other channel: no vote emoji
+        with mock.patch.object(feed_posting, "FEED_COMMUNITY_CHANNEL_ID", 222):  # any other channel: no vote emoji
             await self.check(rss("d", "c", "a", "b"))
         self.assertEqual(len(self.channel.votes_added), 1)
 
     async def test_votes_skip_skippy_and_the_author_and_summaries(self):
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
         await self.check(rss("c", "a", "b"))                     # message 1
         await self.check(rss("e", "d", "c", "a", "b"))           # messages 2, 3
         self.channel.vote(1, 77, 501, 502)                        # author's own vote doesn't count
@@ -532,9 +558,9 @@ class RoundupTests(FeedTestCase):
         await db.archive_feed_posts([(self.feed_id, "Blog", "S1", "https://e.com/s1", "https://discord.com/channels/1/111/9"),
                                      (self.feed_id, "Blog", "S2", "https://e.com/s2", "https://discord.com/channels/1/111/9")])
         posts = await db.roundup_posts(str(CHANNEL_ID))
-        votes = await self.cog._vote_counts(posts)
+        votes = await feed_roundup.vote_counts(self.bot, posts)
         self.assertEqual(votes, {"https://discord.com/channels/1/111/1": 2, "https://discord.com/channels/1/111/3": 1})
-        embed = feeds.build_roundup(posts, MONDAY_9, votes)
+        embed = feed_roundup.build_roundup(posts, MONDAY_9, votes)
         self.assertTrue(embed.fields[0].value.startswith("🥇 [Post c]"))
 
     def test_server_emoji_vote_matches_how_discord_shows_reactions(self):
@@ -562,7 +588,7 @@ class FeedNameTests(FeedTestCase):
         self.assertEqual(self.channel.sent[0][0].author.name, "CirriusTech")
         self.assertEqual((await db.search_feed_posts(["post", "c"]))[0]["feed_title"], "CirriusTech")
         feed = await db.get_feed(self.feed_id, "1")
-        self.assertEqual(feeds.feed_name(feed), "CirriusTech")
+        self.assertEqual(feed_registry.feed_name(feed), "CirriusTech")
         self.assertIn('calls itself "Blog"', feeds.FeedCommands._describe(feed))
 
     async def test_settings_show_when_the_feed_was_last_checked(self):
@@ -574,10 +600,10 @@ class FeedNameTests(FeedTestCase):
 
     async def test_add_takes_a_name_and_a_messy_url(self):
         _, items = feed_reader.parse_feed(rss("new").data)
-        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "Blogs", items, self.channel))
+        self.create_feed = self.patch(feed_registry, "create_feed", mock.AsyncMock(return_value=(self.feed_id, "Blogs", items, self.channel)))
         await feeds.FeedCommands.feed_add.callback(self.cog, interaction(), "<\u200bcirriustech.co.uk/blog/index.xml>",
                                                    name="CirriusTech")
-        self.assertEqual(self.cog._create_feed.await_args.args[1], "https://cirriustech.co.uk/blog/index.xml")
+        self.assertEqual(self.create_feed.await_args.args[1], "https://cirriustech.co.uk/blog/index.xml")
         self.assertEqual(self.channel.sent[0][0].author.name, "CirriusTech")
 
     async def test_edit_sets_and_clears_the_name(self):
@@ -585,7 +611,7 @@ class FeedNameTests(FeedTestCase):
         await feeds.FeedCommands.feed_edit.callback(self.cog, i, self.feed_id, name="  CirriusTech ")
         self.assertEqual((await db.get_feed(self.feed_id, "1"))["display_name"], "CirriusTech")
         await feeds.FeedCommands.feed_edit.callback(self.cog, interaction(), self.feed_id, clear="display_name")
-        self.assertEqual(feeds.feed_name(await db.get_feed(self.feed_id, "1")), "Blog")
+        self.assertEqual(feed_registry.feed_name(await db.get_feed(self.feed_id, "1")), "Blog")
 
 
 class FeedAddressTests(FeedTestCase):
@@ -600,7 +626,7 @@ class FeedAddressTests(FeedTestCase):
     async def test_a_moved_blog_keeps_its_settings_and_reposts_nothing(self):
         await db.update_feed(self.feed_id, "1", display_name="Joey", exclude_words="draft")
         await db.record_feed_check(self.feed_id, None, '"old-etag"', "Mon, 19 Oct 2026 10:00:00 GMT")
-        for _ in range(feeds.ALERT_AFTER_FAILURES):
+        for _ in range(feed_poller.ALERT_AFTER_FAILURES):
             await db.record_feed_check(self.feed_id, "HTTP 404")
         shown = await self.edit_url(" www.example.com/rss.xml ", rss("c", "a", "b"))
         self.assertIn("Updated feed #1", shown)
@@ -635,11 +661,11 @@ class FeedCommandTestCase(FeedTestCase):
         await super().asyncSetUp()
         for name, value in (("FEED_CHANNELS", {"community-feed": CHANNEL_ID, "ms-blogs": 222}),
                             ("DEFAULT_CHANNEL_ID", CHANNEL_ID), ("FEED_COMMUNITY_CHANNEL_ID", CHANNEL_ID)):
-            patcher = mock.patch.object(feeds, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.cog._post = mock.AsyncMock(return_value=set())
-        self.cog._dm = mock.AsyncMock()
+            self.patch_setting(name, value)
+        self.posting = mock.patch.object(feed_posting, "post_items", mock.AsyncMock(return_value=set()))
+        self.posting.start()
+        self.addCleanup(self.posting.stop)
+        self.dm = self.patch(feed_notices, "dm")
 
     def guild_interaction(self, user_id="500"):
         i = interaction(user_id)
@@ -660,7 +686,7 @@ class FeedCommandTestCase(FeedTestCase):
         result = result or rss("x")
         fetch = mock.AsyncMock(side_effect=result) if isinstance(result, Exception) else mock.AsyncMock(return_value=result)
         with mock.patch.object(feed_reader, "fetch_feed", fetch):
-            await feeds.FeedCommands.feed_suggest.callback(self.cog, i, url, author or i.user, **links)
+            await blog.BlogCommands.feed_suggest.callback(self.blog, i, url, author or i.user, **links)
         return i.followup.send.await_args.args[0]
 
 
@@ -691,7 +717,7 @@ class DuplicateTests(FeedCommandTestCase):
         sid = await db.add_suggestion("1", "https://example.com/rss", "Blog", "300", True, None)
         i = self.guild_interaction()
         with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("b"))):
-            await self.cog.approve_suggestion(i, sid)
+            await self.blog.approve_suggestion(i, sid)
         self.assertIn("same blog as feed #1", i.followup.send.await_args.args[0])
         self.assertEqual((await db.get_suggestion(sid))["status"], "pending")
 
@@ -703,7 +729,7 @@ class DuplicateTests(FeedCommandTestCase):
     async def test_the_answer_says_whether_it_credits_you(self):
         self.assertIn("Ask a mod to credit you", await self.suggest("https://example.com/feed"))
         self.assertIn("Ask a mod to credit <@301>", await self.suggest("https://example.com/feed", author=member(301)))
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "300", "9")
+        await feed_registry.link_author(self.feed_id, "1", "300", "9")
         self.assertIn("Its posts credit you", await self.suggest("https://example.com/feed"))
 
     async def test_the_same_suggestion_written_differently_waits_once(self):
@@ -718,10 +744,10 @@ class AuthorTests(FeedCommandTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
 
     async def test_a_suggestion_always_names_an_author(self):
-        self.assertTrue(feeds.FeedCommands.feed_suggest.get_parameter("author").required)  # even if it's you
+        self.assertTrue(blog.BlogCommands.feed_suggest.get_parameter("author").required)  # even if it's you
         await self.suggest("https://mine.example/feed")                          # picking themselves
         await self.suggest("https://theirs.example/feed", author=member(301))    # or another member
         authors = [(s["suggested_by"], s["author_id"]) for s in await db.pending_suggestions("1")]
@@ -761,7 +787,7 @@ class AuthorTests(FeedCommandTestCase):
         sid = await db.add_suggestion("1", "https://second.example/feed", "Second", "77", "77", None)
         i = self.guild_interaction()
         with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("x"))):
-            await self.cog.approve_suggestion(i, sid)
+            await self.blog.approve_suggestion(i, sid)
         self.assertIn("already has a blog", i.followup.send.await_args.args[0])
         self.assertEqual((await db.get_suggestion(sid))["status"], "pending")
 
@@ -776,7 +802,7 @@ class RefusalReportTests(FeedCommandTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
 
     def reports(self):
         return [content for content, _ in self.alerts.sent if content.startswith("🚫")]
@@ -796,7 +822,7 @@ class RefusalReportTests(FeedCommandTestCase):
         bot.bot = True
         await self.suggest("https://bot.example/feed", author=bot)
         await self.suggest("http://www.example.com/feed/", author=member(301))
-        await self.suggest("https://broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        await self.suggest("https://broken.example/feed", result=FeedError("HTTP 404"))
         reports = self.reports()
         self.assertIn("the author is a bot", reports[0])
         self.assertIn("suggested <@301>'s blog", reports[1])
@@ -805,12 +831,12 @@ class RefusalReportTests(FeedCommandTestCase):
 
     async def test_retrying_the_same_blog_is_reported_once_an_hour(self):
         for _ in range(3):
-            await self.suggest("https://broken.example/feed", result=feeds.FeedError("HTTP 404"))
+            await self.suggest("https://broken.example/feed", result=FeedError("HTTP 404"))
         self.assertEqual(len(self.reports()), 1)
-        await self.suggest("https://other-broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        await self.suggest("https://other-broken.example/feed", result=FeedError("HTTP 404"))
         self.assertEqual(len(self.reports()), 2)
-        self.cog.refusals_told = {k: t - feeds.REFUSAL_REPEAT_SECONDS for k, t in self.cog.refusals_told.items()}
-        await self.suggest("https://broken.example/feed", result=feeds.FeedError("HTTP 404"))
+        self.blog.refusals_told = {k: t - blog.REFUSAL_REPEAT_SECONDS for k, t in self.blog.refusals_told.items()}
+        await self.suggest("https://broken.example/feed", result=FeedError("HTTP 404"))
         self.assertEqual(len(self.reports()), 3)
 
     async def test_accepted_suggestions_are_not_reported(self):
@@ -826,18 +852,18 @@ class ProfileLinkTests(FeedCommandTestCase):
 
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        await feeds.FeedCommands._link_author(self.feed_id, "1", "77", "9")
+        await feed_registry.link_author(self.feed_id, "1", "77", "9")
 
     async def links_command(self, user_id="77", **options):
         i = self.guild_interaction(user_id)
-        await feeds.FeedCommands.blog_links.callback(self.cog, i, **options)
+        await blog.BlogCommands.blog_links.callback(self.blog, i, **options)
         return i.response.send_message.await_args.args[0]
 
     async def test_posts_show_the_authors_links_under_the_credit(self):
         await db.set_author_links("77", {"linkedin": self.LINKEDIN, "x": "https://x.com/jonasb"})
-        del self.cog._post  # post for real
+        self.posting.stop()  # post for real
         await self.check(rss("c", "a", "b"))
-        emoji = feeds.FEED_LINK_EMOJIS
+        emoji = feed_posting.FEED_LINK_EMOJIS
         self.assertEqual(self.channel.sent[0][0].description.split("\n"),
                          ["by <@77>", f"{emoji['linkedin']} [jonas-b](<{self.LINKEDIN}>)  "
                                       f"{emoji['x']} [@jonasb](<https://x.com/jonasb>)"])
@@ -847,7 +873,7 @@ class ProfileLinkTests(FeedCommandTestCase):
         suggestion = (await db.pending_suggestions("1"))[0]
         self.assertIn(self.LINKEDIN, self.alerts.embeds[-1].fields[-1].value)
         with mock.patch.object(feed_reader, "fetch_feed", mock.AsyncMock(return_value=rss("x"))):
-            await self.cog.approve_suggestion(self.guild_interaction(), suggestion["id"])
+            await self.blog.approve_suggestion(self.guild_interaction(), suggestion["id"])
         self.assertEqual(await db.get_author_links("300"), {"linkedin": self.LINKEDIN})
 
     async def test_a_bad_link_is_a_typo_not_a_refusal(self):
@@ -889,9 +915,7 @@ class ConsistentPostsTests(FeedTestCase):
         await super().asyncSetUp()
         for name, value in (("FEED_COMMUNITY_CHANNEL_ID", CHANNEL_ID), ("FEED_THREAD_CHANNEL_IDS", {CHANNEL_ID}),
                             ("FEED_VOTE_EMOJI", "👍")):
-            patcher = mock.patch.object(feeds, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+            self.patch_setting(name, value)
 
     async def test_feed_test_posts_like_any_other_post(self):
         i = interaction()
@@ -929,11 +953,11 @@ class ConsistentPostsTests(FeedTestCase):
         self.channel.vote(2, 501, 502)
         posts = await db.roundup_posts(str(CHANNEL_ID))
         self.assertEqual(len(posts), 2)
-        embed = feeds.build_roundup(posts, MONDAY_9, await self.cog._vote_counts(posts))
+        embed = feed_roundup.build_roundup(posts, MONDAY_9, await feed_roundup.vote_counts(self.bot, posts))
         self.assertEqual(embed.description.count("[Post c]"), 1)
         self.assertIn("· 2", embed.fields[0].value)  # the copy with the votes counts
         i = interaction()
-        await feeds.FeedCommands.feed_search.callback(self.cog, i, "post c")
+        await blog.BlogCommands.feed_search.callback(self.blog, i, "post c")
         self.assertEqual(i.response.send_message.await_args.kwargs["embed"].description.count("[Post c]"), 1)
 
 
@@ -964,48 +988,48 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
         if os.path.exists(os.environ["SKIPPY_DB_PATH"]):
             os.remove(os.environ["SKIPPY_DB_PATH"])
         await db.init_db()
-        self.cog = feeds.FeedCommands.__new__(feeds.FeedCommands)
-        self.cog.bot = mock.Mock()
-        self.cog._dm = mock.AsyncMock()
+        self.blog = blog.BlogCommands(mock.Mock())
+        self.dm = start_patch(self, feed_notices, "dm")
         self.sid = await db.add_suggestion("1", "https://blog.example/feed", "My Blog", "300", "300", None)
         self.channel = FakeChannel()
         self.feed_id = await db.add_feed("1", str(CHANNEL_ID), "https://blog.example/feed", "My Blog", "500")
         _, items = feed_reader.parse_feed(rss("latest", "older").data)
-        self.cog._create_feed = mock.AsyncMock(return_value=(self.feed_id, "My Blog", items, self.channel))
+        self.create_feed = start_patch(self, feed_registry, "create_feed",
+                                       mock.AsyncMock(return_value=(self.feed_id, "My Blog", items, self.channel)))
 
     async def test_approve_adds_feed_credits_author_and_tells_everyone(self):
         i = interaction()
-        await self.cog.approve_suggestion(i, self.sid)
-        self.cog._create_feed.assert_awaited_once_with(i.guild, "https://blog.example/feed",
-                                                       feeds.DEFAULT_CHANNEL_ID, "300", "500")
+        await self.blog.approve_suggestion(i, self.sid)
+        self.create_feed.assert_awaited_once_with(i.guild, "https://blog.example/feed",
+                                                       feed_registry.DEFAULT_CHANNEL_ID, "300", "500")
         suggestion = await db.get_suggestion(self.sid)
         self.assertEqual((suggestion["status"], suggestion["decided_by"]), ("approved", "500"))
         card = i.message.edit.await_args.kwargs
         self.assertIsNone(card["view"])  # buttons removed
         self.assertIn(f"Approved by <@500>: feed #{self.feed_id}", card["embed"].fields[-1].value)
-        self.assertIn("approved", self.cog._dm.await_args.args[1])
+        self.assertIn("approved", self.dm.await_args.args[2])
         self.assertEqual(len(self.channel.sent), 1)  # the blog's newest article, as a welcome
         self.assertEqual((self.channel.sent[0][0].author.name, self.channel.sent[0][0].title), ("My Blog", "Post latest"))
 
     async def test_another_members_blog_credits_them_and_tells_both(self):
         sid = await db.add_suggestion("1", "https://other.example/feed", "Other", "300", "301", None)
-        await self.cog.approve_suggestion(interaction(), sid)
-        self.assertEqual(self.cog._create_feed.await_args.args[3], "301")
-        told = {call.args[0]: call.args[1] for call in self.cog._dm.await_args_list}
+        await self.blog.approve_suggestion(interaction(), sid)
+        self.assertEqual(self.create_feed.await_args.args[3], "301")
+        told = {call.args[1]: call.args[2] for call in self.dm.await_args_list}
         self.assertIn("crediting <@301>", told["300"])
         self.assertIn("suggested by <@300>", told["301"])
 
     async def test_second_mod_cannot_decide_again(self):
-        await self.cog.approve_suggestion(interaction("500"), self.sid)
+        await self.blog.approve_suggestion(interaction("500"), self.sid)
         late = interaction("501")
-        await self.cog.reject_suggestion(late, self.sid, "nope")
+        await self.blog.reject_suggestion(late, self.sid, "nope")
         self.assertIn("already decided", late.response.send_message.await_args.args[0])
         self.assertEqual((await db.get_suggestion(self.sid))["status"], "approved")
 
     async def test_failed_approval_goes_back_to_the_queue(self):
-        self.cog._create_feed.side_effect = feeds.FeedError("HTTP 404")
+        self.create_feed.side_effect = FeedError("HTTP 404")
         i = interaction()
-        await self.cog.approve_suggestion(i, self.sid)
+        await self.blog.approve_suggestion(i, self.sid)
         self.assertEqual((await db.get_suggestion(self.sid))["status"], "pending")
         self.assertIn("HTTP 404", i.followup.send.await_args.args[0])
         i.message.edit.assert_not_awaited()  # card and buttons untouched
@@ -1013,14 +1037,14 @@ class SuggestionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reject_with_reason(self):
         i = interaction()
-        await self.cog.reject_suggestion(i, self.sid, "Not about Microsoft tech")
+        await self.blog.reject_suggestion(i, self.sid, "Not about Microsoft tech")
         suggestion = await db.get_suggestion(self.sid)
         self.assertEqual((suggestion["status"], suggestion["reason"]), ("rejected", "Not about Microsoft tech"))
         self.assertIn("Rejected by <@500>: Not about Microsoft tech", i.message.edit.await_args.kwargs["embed"].fields[-1].value)
-        self.assertIn("Reason: Not about Microsoft tech", self.cog._dm.await_args.args[1])
+        self.assertIn("Reason: Not about Microsoft tech", self.dm.await_args.args[2])
 
     async def test_buttons_only_work_for_mods(self):
-        button = feeds.SuggestionButton("approve", self.sid)
+        button = blog.SuggestionButton("approve", self.sid)
         self.assertEqual(button.item.custom_id, f"feed-suggestion:approve:{self.sid}")
         self.assertTrue(await button.interaction_check(interaction(mod=True)))
         member = interaction(mod=False)

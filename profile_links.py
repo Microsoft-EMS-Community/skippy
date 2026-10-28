@@ -24,6 +24,9 @@ EXAMPLES = {
     "github": "github.com/yourname",
 }
 
+# How each site's option reads on commands that take profile links.
+OPTION_TEXT = {site: f"{label} profile, like {EXAMPLES[site]}" for site, label in SITES.items()}
+
 _HOSTS = {
     "linkedin": {"linkedin.com"},
     "x": {"x.com", "twitter.com"},
@@ -39,6 +42,12 @@ _YOUTUBE = re.compile(r"/(@[\w.\-]{3,30}|channel/UC[\w\-]{22})", re.ASCII)
 _GITHUB = re.compile(r"/([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})")
 _GITHUB_RESERVED = {"orgs", "topics", "explore", "marketplace", "settings", "login", "about", "features",
                     "pricing", "sponsors", "search", "notifications", "issues", "pulls"}
+
+
+def read_all(**given: str | None) -> dict[str, str]:
+    """Profile links as given per site (None when left out), checked and in
+    their standard form. Raises ValueError with a message for the member."""
+    return {site: normalize(site, value) for site, value in given.items() if value}
 
 
 def normalize(site: str, raw: str) -> str:

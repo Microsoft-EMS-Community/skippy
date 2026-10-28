@@ -24,7 +24,10 @@ EXTENSIONS = (
     "link_watch",         # tracking junk and dangerous short links
     "mentions",           # answering @Skippy
     "rss_watch",          # the RSS watchlist and /rsswatch
-    "feeds",              # /feed and /blog: posting RSS/Atom feeds
+    "feeds",              # /feed: managing the RSS/Atom feeds Skippy posts
+    "feed_poller",        # checking feeds for new posts
+    "feed_roundup",       # Monday's community roundup
+    "blog",               # /blog: suggestions, search, profile links
     "guide",              # /help
     "fun",                # /ghostcheck /verdict /roulette /trial /slap /effie
 )
