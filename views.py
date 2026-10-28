@@ -1,10 +1,22 @@
 # ============================================================
 # views.py - Discord UI button views for helper log embeds
 # Uses custom_id encoding to survive bot restarts.
-# Interaction handling is in bot.py (on_interaction).
+# Clicks are handled by followup_events.py (Unmark, Re-flag) and
+# new_accounts.py (verification), via button_action().
 # ============================================================
 
 import discord
+
+
+def button_action(interaction: discord.Interaction) -> tuple[str, str] | None:
+    """(action, user_id) for a click on one of these buttons, whose
+    custom_id is "followup:ACTION:USER_ID"; None for anything else."""
+    if interaction.type != discord.InteractionType.component:
+        return None
+    parts = interaction.data.get("custom_id", "").split(":")
+    if len(parts) != 3 or parts[0] != "followup":
+        return None
+    return parts[1], parts[2]
 
 
 class FlaggedView(discord.ui.View):

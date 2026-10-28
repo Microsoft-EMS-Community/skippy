@@ -1,16 +1,15 @@
 # ============================================================
-# tasks.py - Background tasks (runs on a 24h loop)
+# followup_tasks.py - Follow-ups over time (runs on a 24h loop)
 # Warning progression: 48h → warning ping, 7d → mark ignored
+# Plus the monthly cleanup of old follow-ups and audit log entries.
 # ============================================================
 
 import logging
-import discord
 from discord.ext import commands, tasks
 
-import datetime as dt
 import db
 import followup_notify
-from config import AWAITING_ROLE_ID, HELPER_LOG_CHANNEL_ID, GUILD_ID, RSS_AUDIT_CHANNEL_ID
+from config import HELPER_LOG_CHANNEL_ID, GUILD_ID
 
 logger = logging.getLogger("followup-bot")
 
@@ -20,15 +19,12 @@ class FollowUpTasks(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._last_monthly_report: str | None = None  # tracks "YYYY-MM" of last auto-report
         self.warning_check.start()
         self.monthly_cleanup.start()
-        self.monthly_rss_report.start()
 
     def cog_unload(self):
         self.warning_check.cancel()
         self.monthly_cleanup.cancel()
-        self.monthly_rss_report.cancel()
 
     # ──────────────────────────────────────────
     # 24-hour warning check loop
@@ -123,7 +119,7 @@ class FollowUpTasks(commands.Cog):
         )
 
         # Post summary to helper log
-        guild = self.bot.get_guild(int(__import__('config').GUILD_ID))
+        guild = self.bot.get_guild(GUILD_ID)
         if guild:
             log_channel = guild.get_channel(HELPER_LOG_CHANNEL_ID)
             if log_channel and (result["audit_log"] > 0 or result["follow_ups"] > 0):
@@ -136,67 +132,6 @@ class FollowUpTasks(commands.Cog):
 
     @monthly_cleanup.before_loop
     async def before_monthly_cleanup(self):
-        await self.bot.wait_until_ready()
-
-    # ──────────────────────────────────────────
-    # Monthly RSS watchlist auto-report (1st of month, 09:00 UTC)
-    # ──────────────────────────────────────────
-    @tasks.loop(hours=1)
-    async def monthly_rss_report(self):
-        now = dt.datetime.utcnow()
-        if now.day != 1 or now.hour != 9:
-            return
-        month_key = now.strftime("%Y-%m")
-        if self._last_monthly_report == month_key:
-            return  # already fired this month
-        self._last_monthly_report = month_key
-
-        guild = self.bot.get_guild(GUILD_ID)
-        if not guild:
-            return
-        audit_channel = guild.get_channel(RSS_AUDIT_CHANNEL_ID)
-        if not audit_channel:
-            return
-
-        watchlist = await db.get_watchlist(str(GUILD_ID))
-        if not watchlist:
-            await audit_channel.send("📄 **Monthly RSS Watchlist Report** - watchlist is empty.")
-            return
-
-        lines = []
-        for entry in watchlist:
-            uid = entry["user_id"]
-            count = await db.get_rss_activity_count(uid, days=30)
-            latest = await db.get_latest_rss_message(uid)
-            member = guild.get_member(int(uid))
-            name = member.display_name if member else f"‹{uid}›"
-            badge = "🟢" if count >= 5 else ("🟡" if count >= 1 else "🔴")
-            last_link = f"[latest]({latest['message_link']})" if latest else "no messages"
-            last_seen = latest["sent_at"][:10] if latest else "never"
-            lines.append(f"{badge} **{name}** | Last seen: {last_seen} | Msgs (30d): {count} | {last_link}")
-
-        # Cleanup old activity after report
-        await db.cleanup_rss_activity(days=30)
-
-        report = "📊 **Monthly RSS Watchlist Report** - " + now.strftime("%B %Y") + "\n\n" + "\n".join(lines)
-        # Discord 2000 char limit - split if needed
-        if len(report) <= 2000:
-            await audit_channel.send(report)
-        else:
-            await audit_channel.send("📊 **Monthly RSS Watchlist Report** - " + now.strftime("%B %Y"))
-            chunk = ""
-            for line in lines:
-                if len(chunk) + len(line) + 1 > 1900:
-                    await audit_channel.send(chunk)
-                    chunk = ""
-                chunk += line + "\n"
-            if chunk:
-                await audit_channel.send(chunk)
-
-        logger.info(f"Monthly RSS report posted for {month_key}")
-
-    @monthly_rss_report.before_loop
-    async def before_monthly_rss_report(self):
         await self.bot.wait_until_ready()
 
 
