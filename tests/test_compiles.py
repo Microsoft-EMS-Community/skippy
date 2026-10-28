@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class CompileTests(unittest.TestCase):
     def test_every_module_compiles(self):
-        modules = sorted(ROOT.glob("*.py"))
+        modules = sorted(ROOT.glob("*.py")) + sorted(ROOT.glob("db/*.py"))
         self.assertTrue(modules)
         for path in modules:
             with self.subTest(module=path.name):
