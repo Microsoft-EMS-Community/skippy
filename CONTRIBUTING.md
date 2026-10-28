@@ -49,7 +49,7 @@ Each feature is its own module, with its own commands and event listeners.
 | Blogs (`/blog`) | `blog.py` (suggestions, search, profile links), `profile_links.py` |
 | RSS watchlist | `rss_watch.py` |
 | `/help`, @mentions, fun | `guide.py`, `mentions.py`, `fun.py` |
-| Shared | `checks.py` (who may use what), `db.py` (the SQLite database) |
+| Shared | `checks.py` (who may use what), `db/` (the SQLite database: one file per area, each creating its own tables; everything is used as `db.<function>`) |
 | Tests | `tests/`; `tests/discord_fakes.py` stands in for Discord |
 | Server setup | `deploy/`, reference copies of the service and auto-deploy |
 

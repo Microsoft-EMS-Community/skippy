@@ -69,7 +69,7 @@ class EventTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def audit_actions(self) -> list[str]:
         """Every audit log action so far, oldest first."""
-        async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        async with db.connect() as conn:
             return [row[0] for row in await (await conn.execute("SELECT action FROM audit_log ORDER BY id")).fetchall()]
 
 
@@ -335,7 +335,7 @@ class WatchlistTests(EventTestCase):
         message = self.guild.general.post(self.alice, "hello")
         await self.event("message", message)
         await self.event("message", self.guild.general.post(self.helper, "hi"))  # not watched
-        async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        async with db.connect() as conn:
             rows = await (await conn.execute("SELECT user_id, message_link FROM rss_activity")).fetchall()
         self.assertEqual(rows, [(str(self.alice.id), message.jump_url)])
 
