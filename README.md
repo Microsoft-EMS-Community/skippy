@@ -65,6 +65,9 @@ full guide there.
     Cleared out every month.
   - **Profile links** bloggers add to their posts, until they remove them or
     their blog leaves the feed.
+  - **Anonymous polls:** your vote is stored under a scrambled code, never
+    your name or ID. Nobody can see who voted for what, and the codes are
+    deleted when the poll closes; only the totals stay.
   - **Its log of actions** is kept for 90 days, and its technical log for 7.
 - **Every change is checked.** All of Skippy's code is public, right here.
   Each change is reviewed by a moderator and has to pass the automated tests

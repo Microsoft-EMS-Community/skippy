@@ -28,6 +28,7 @@ EXTENSIONS = (
     "feed_poller",        # checking feeds for new posts
     "feed_roundup",       # Monday's community roundup
     "blog",               # /blog: suggestions, search, profile links
+    "polls",              # /poll: anonymous polls
     "guide",              # /help
     "fun",                # /ghostcheck /verdict /roulette /trial /slap /effie
 )
