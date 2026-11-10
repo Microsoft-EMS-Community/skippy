@@ -206,12 +206,22 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(f"<@{member.id}>", description)
             self.assertNotIn(str(member), description)
 
-    async def test_everyone_voted(self):
+    async def test_a_roles_poll_closes_as_soon_as_the_whole_role_has_voted(self):
         await self.create(role=self.role)
-        for member in self.contributors:
+        self.assertIn("as soon as everyone has voted", self.card().description)
+        for member in self.contributors[:3]:
             await self.click(member, 0)
-        await self.cog.close_poll(await db.get_poll(1))
+        self.assertIsNone((await db.get_poll(1))["closed_at"])
+        self.assertIn("Your vote is in", await self.click(self.contributors[3], 1))
+        self.assertIsNotNone((await db.get_poll(1))["closed_at"])
         self.assertIn("everyone voted", self.card().description)
+        self.assertIn("75% (3)", self.card().description)
+
+    async def test_a_poll_for_everyone_never_closes_early(self):
+        await self.create()
+        for user_id in range(20, 30):
+            await self.click(Member(user_id), 0)
+        self.assertIsNone((await db.get_poll(1))["closed_at"])
 
     async def test_closing_erases_who_voted(self):
         await self.create(role=self.role)
@@ -303,7 +313,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_reminder_when_the_whole_role_has_voted(self):
         await self.create(role=self.role)
         for member in self.contributors:
-            await self.click(member, 0)
+            await db.cast_poll_vote(1, poll_cards.voter_key((await db.get_poll(1))["secret"], member.id), 0)
         with mock.patch.object(polls.feed_notices, "dm", mock.AsyncMock()) as dm:
             await self.due("remind_at")
         dm.assert_not_awaited()

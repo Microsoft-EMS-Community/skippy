@@ -2,7 +2,8 @@
 # polls.py - /poll, for moderators: anonymous polls. Members vote with
 # buttons; the card shows only how many have voted until the poll closes,
 # then the results. A poll can be for one role: only its members vote, and
-# the result says how many of them didn't (never who).
+# the result says how many of them didn't (never who), and it closes as soon
+# as all of them have voted.
 # ============================================================
 
 import logging
@@ -196,6 +197,10 @@ class Polls(commands.Cog):
         await interaction.response.send_message(
             f"Your vote is in: **{poll['options'][choice]}**. You can change it until the poll closes.",
             ephemeral=True)
+        members = role_voters(interaction.guild, poll)
+        if members and not absent(poll, members, await db.poll_voters(poll_id)):
+            await self.close_poll(poll)  # the whole role has voted: nothing left to wait for
+            return
         try:
             await interaction.message.edit(embed=await self.open_card(interaction.guild, poll))
         except discord.HTTPException as e:

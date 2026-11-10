@@ -69,12 +69,13 @@ def open_card(poll: dict, votes: int, eligible: int | None = None, voted: int | 
     if poll["role_id"]:
         who = f"For <@&{poll['role_id']}>. "
         turnout = f"**{voted} of {eligible}** have voted"
+        closes = ", or as soon as everyone has voted"
     else:
-        who, turnout = "", f"**{_votes(votes)} so far**"
+        who, turnout, closes = "", f"**{_votes(votes)} so far**", ""
     embed = discord.Embed(
         title=f"🗳️ {poll['question']}",
         description=(f"{who}Pick one. Your vote is anonymous and you can change it until the poll closes.\n\n"
-                     f"{turnout} · closes <t:{closes_timestamp(poll)}:R>"),
+                     f"{turnout} · closes <t:{closes_timestamp(poll)}:R>{closes}"),
         color=0x7c3aed)
     embed.set_footer(text="Anonymous poll · results are shown when it closes")
     return embed
