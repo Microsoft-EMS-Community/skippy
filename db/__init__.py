@@ -16,8 +16,8 @@ from .followups import (add_follow_up, get_avg_resolution_time, get_left_server_
                         get_overdue_follow_ups, get_server_stats, get_user_score, increment_flag_count,
                         increment_ignored_count, increment_resolved_count, mark_ignored, mark_left_server,
                         mark_warning_sent, resolve_all_open_follow_ups)
-from .polls import (add_poll, cast_poll_vote, close_poll, delete_poll, get_poll, open_polls, poll_voters,
-                    set_poll_message)
+from .polls import (add_poll, cast_poll_vote, close_poll, delete_poll, get_poll, mark_poll_reminded, open_polls,
+                    poll_voters, polls_to_remind, set_poll_message)
 from .settings import get_setting, set_setting
 from .suggestions import (add_suggestion, decide_suggestion, get_suggestion, pending_suggestions,
                           set_suggestion_message)

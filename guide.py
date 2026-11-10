@@ -137,10 +137,12 @@ def moderator_help() -> discord.Embed:
         name="🗳️ Anonymous polls",
         value=(
             "`/poll create <question> <option1> <option2>` - posts in the channel you're in; up to 5 "
-            "choices, open 1 hour to 2 weeks. The card shows only how many voted until it closes, then "
+            "choices, open 30 minutes to 2 weeks. The card shows only how many voted until it closes, then "
             "the results. Nobody can see who voted for what.\n"
             "• `role`: only that role votes and gets pinged; the result says how many of it didn't "
             "vote, never who\n"
+            "• One reminder when a quarter of the time is left (a day before at most; none for polls "
+            "under 2 hours): a line in the channel, plus a DM to the role's members who haven't voted\n"
             "`/poll close <poll>` - close it early"
         ),
         inline=False

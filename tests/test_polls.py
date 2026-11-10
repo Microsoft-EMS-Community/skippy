@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -78,7 +79,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(send_message=mock.AsyncMock(), defer=mock.AsyncMock()),
             followup=SimpleNamespace(send=mock.AsyncMock()))
 
-    async def create(self, *options, role=None, question="Second summit?", duration=72):
+    async def create(self, *options, role=None, question="Second summit?", duration=None):
         interaction = self.interaction(self.mod)
         padded = (list(options) or ["Yes", "No"]) + [None] * 5
         await polls.Polls.create.callback(self.cog, interaction, question, *padded[:5], duration=duration, role=role)
@@ -230,8 +231,7 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
     async def test_due_polls_close_on_their_own(self):
         await self.create(question="Due")
         await self.create(question="Not yet")
-        await db.connection.execute("UPDATE polls SET closes_at = '2020-01-01T00:00:00' WHERE id = 1")
-        await polls.Polls.close_due.coro(self.cog)
+        await self.due("closes_at")
         self.assertEqual([p["question"] for p in await db.open_polls()], ["Not yet"])
 
     async def test_closing_still_works_when_the_card_is_gone(self):
@@ -246,6 +246,74 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("closed", interaction.followup.send.await_args.args[0])
         await polls.Polls.close.callback(self.cog, interaction, 1)
         self.assertIn("isn't open", interaction.response.send_message.await_args.args[0])
+
+    # ---- reminders ----
+
+    async def due(self, column, poll_id=1):
+        await db.connection.execute(f"UPDATE polls SET {column} = '2020-01-01T00:00:00' WHERE id = ?", (poll_id,))
+        await polls.Polls.close_due.coro(self.cog)
+
+    def test_the_reminder_comes_when_a_quarter_is_left_a_day_before_at_most(self):
+        start = datetime(2026, 1, 1)
+        for duration, before in ((timedelta(weeks=2), timedelta(hours=24)), (timedelta(weeks=1), timedelta(hours=24)),
+                                 (timedelta(days=3), timedelta(hours=18)), (timedelta(hours=8), timedelta(hours=2)),
+                                 (timedelta(hours=2), timedelta(minutes=30))):
+            self.assertEqual(poll_cards.reminder_time(start, start + duration), start + duration - before)
+        for short in (timedelta(minutes=30), timedelta(hours=1)):
+            self.assertIsNone(poll_cards.reminder_time(start, start + short))
+
+    async def test_durations_and_defaults(self):
+        await self.create()
+        await self.create(role=self.role)
+        await self.create(duration=polls.DURATIONS["30 minutes"])
+        everyone, role, short = await db.open_polls()
+
+        def lasts(poll):
+            return datetime.fromisoformat(poll["closes_at"]) - datetime.fromisoformat(poll["created_at"])
+        self.assertAlmostEqual(lasts(everyone).total_seconds(), timedelta(days=3).total_seconds(), delta=5)
+        self.assertAlmostEqual(lasts(role).total_seconds(), timedelta(weeks=1).total_seconds(), delta=5)
+        self.assertAlmostEqual(lasts(short).total_seconds(), 1800, delta=5)
+        self.assertIsNone(short["remind_at"])
+
+    async def test_a_reminder_goes_out_once_without_pinging_anyone(self):
+        await self.create()
+        start_dm = mock.patch.object(polls.feed_notices, "dm", mock.AsyncMock())
+        with start_dm as dm:
+            await self.due("remind_at")
+            await polls.Polls.close_due.coro(self.cog)
+        self.assertEqual(len(self.channel.sent), 2)
+        reminder = self.channel.sent[1]
+        self.assertIn(f"https://discord.com/channels/{GUILD_ID}/{CHANNEL_ID}/5000", reminder.content)
+        self.assertIn("Second summit?", reminder.content)
+        self.assertEqual(reminder.allowed_mentions.to_dict(), discord.AllowedMentions.none().to_dict())
+        dm.assert_not_awaited()  # nobody in particular is waited for
+
+    async def test_a_roles_reminder_dms_only_those_who_havent_voted(self):
+        await self.create(role=self.role)
+        await self.click(self.contributors[0], 0)
+        with mock.patch.object(polls.feed_notices, "dm", mock.AsyncMock()) as dm:
+            await self.due("remind_at")
+        self.assertEqual(sorted(call.args[1] for call in dm.await_args_list), ["2", "3", "4"])
+        self.assertIn("Second summit?", dm.await_args.args[2])
+        line = self.channel.sent[1].content
+        self.assertIn(f"3 of <@&{ROLE_ID}> still to vote", line)
+        for member in self.contributors:
+            self.assertNotIn(f"<@{member.id}>", line)
+
+    async def test_no_reminder_when_the_whole_role_has_voted(self):
+        await self.create(role=self.role)
+        for member in self.contributors:
+            await self.click(member, 0)
+        with mock.patch.object(polls.feed_notices, "dm", mock.AsyncMock()) as dm:
+            await self.due("remind_at")
+        dm.assert_not_awaited()
+        self.assertEqual(len(self.channel.sent), 1)
+
+    async def test_a_closed_poll_isnt_reminded(self):
+        await self.create()
+        await self.cog.close_poll(await db.get_poll(1))
+        await self.due("remind_at")
+        self.assertEqual(len(self.channel.sent), 1)
 
     # ---- anonymity ----
 

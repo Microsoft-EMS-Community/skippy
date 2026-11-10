@@ -20,6 +20,8 @@ SCHEMA = """
         created_by TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         closes_at TIMESTAMP NOT NULL,
+        remind_at TIMESTAMP,                      -- when to say it's about to close; NULL = never
+        reminded_at TIMESTAMP,
         closed_at TIMESTAMP,
         secret TEXT,                              -- scrambles voters' IDs; erased at close
         results TEXT,                             -- JSON list of votes per choice, set at close
@@ -43,11 +45,12 @@ def _poll(row: dict | None) -> dict | None:
 
 
 async def add_poll(guild_id: str, channel_id: str, question: str, options: list[str], role_id: str | None,
-                   created_by: str, closes_at: str, secret: str) -> int:
+                   created_by: str, closes_at: str, remind_at: str | None, secret: str) -> int:
     cursor = await execute(
-        """INSERT INTO polls (guild_id, channel_id, question, options, role_id, created_by, closes_at, secret)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (guild_id, channel_id, question, json.dumps(options), role_id, created_by, closes_at, secret)
+        """INSERT INTO polls (guild_id, channel_id, question, options, role_id, created_by, closes_at,
+                              remind_at, secret)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (guild_id, channel_id, question, json.dumps(options), role_id, created_by, closes_at, remind_at, secret)
     )
     return cursor.lastrowid
 
@@ -75,6 +78,21 @@ async def open_polls(guild_id: str | None = None, due_by: str | None = None) -> 
         query += " AND closes_at <= ?"
         params.append(due_by)
     return [_poll(row) for row in await fetch_all(query + " ORDER BY id", params)]
+
+
+async def polls_to_remind(now: str) -> list[dict]:
+    """Open polls whose about-to-close reminder is due and hasn't gone out."""
+    rows = await fetch_all(
+        """SELECT * FROM polls WHERE closed_at IS NULL AND reminded_at IS NULL
+           AND remind_at <= ? AND closes_at > ? ORDER BY id""", (now, now))
+    return [_poll(row) for row in rows]
+
+
+async def mark_poll_reminded(poll_id: int) -> bool:
+    """Claim a poll's reminder, so it goes out once. False if it already did."""
+    cursor = await execute("UPDATE polls SET reminded_at = ? WHERE id = ? AND reminded_at IS NULL",
+                           (utc_now().isoformat(), poll_id))
+    return cursor.rowcount > 0
 
 
 async def cast_poll_vote(poll_id: int, voter: str, choice: int) -> bool:

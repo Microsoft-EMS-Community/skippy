@@ -23,7 +23,9 @@ from db.connection import utc_now
 logger = logging.getLogger("followup-bot")
 
 MAX_QUESTION, MAX_OPTION = 250, 80  # what fits a card's title and a button
-DURATIONS = {"1 hour": 1, "1 day": 24, "3 days": 72, "1 week": 168, "2 weeks": 336}
+DURATIONS = {"30 minutes": 30, "1 hour": 60, "8 hours": 480, "1 day": 1440, "3 days": 4320, "1 week": 10080,
+             "2 weeks": 20160}  # in minutes
+DEFAULT_DURATION, DEFAULT_ROLE_DURATION = DURATIONS["3 days"], DURATIONS["1 week"]
 
 
 class VoteButton(discord.ui.DynamicItem[discord.ui.Button], template=r"poll:(?P<id>[0-9]+):(?P<choice>[0-9]+)"):
@@ -70,8 +72,13 @@ def role_voters(guild, poll: dict) -> list | None:
     return [m for m in role.members if not m.bot] if role else None
 
 
-def count_absent(poll: dict, members: list, voters: set[str]) -> int:
-    return sum(poll_cards.voter_key(poll["secret"], m.id) not in voters for m in members)
+def absent(poll: dict, members: list, voters: set[str]) -> list:
+    """The role's members who haven't voted. Only ever counted or reminded in private."""
+    return [m for m in members if poll_cards.voter_key(poll["secret"], m.id) not in voters]
+
+
+def card_url(poll: dict) -> str:
+    return f"https://discord.com/channels/{poll['guild_id']}/{poll['channel_id']}/{poll['message_id']}"
 
 
 class Polls(commands.Cog):
@@ -99,10 +106,10 @@ class Polls(commands.Cog):
         question="What you're asking",
         option1="First choice", option2="Second choice", option3="Third choice (optional)",
         option4="Fourth choice (optional)", option5="Fifth choice (optional)",
-        duration="How long people can vote (default: 3 days)",
+        duration="How long people can vote (default: 3 days, or 1 week with a role)",
         role="Only this role votes; it gets pinged, and the result says how many of it didn't vote")
-    @app_commands.choices(duration=[app_commands.Choice(name=name, value=hours)
-                                    for name, hours in DURATIONS.items()])
+    @app_commands.choices(duration=[app_commands.Choice(name=name, value=minutes)
+                                    for name, minutes in DURATIONS.items()])
     @is_rss_admin()
     async def create(self, interaction: discord.Interaction, question: app_commands.Range[str, 1, MAX_QUESTION],
                      option1: app_commands.Range[str, 1, MAX_OPTION],
@@ -110,7 +117,7 @@ class Polls(commands.Cog):
                      option3: app_commands.Range[str, 1, MAX_OPTION] | None = None,
                      option4: app_commands.Range[str, 1, MAX_OPTION] | None = None,
                      option5: app_commands.Range[str, 1, MAX_OPTION] | None = None,
-                     duration: int = DURATIONS["3 days"], role: discord.Role | None = None):
+                     duration: int | None = None, role: discord.Role | None = None):
         options = [o.strip() for o in (option1, option2, option3, option4, option5) if o and o.strip()]
         if len(set(options)) != len(options) or len(options) < 2:
             await interaction.response.send_message("A poll needs at least 2 different choices.", ephemeral=True)
@@ -120,10 +127,13 @@ class Polls(commands.Cog):
                                                     ephemeral=True)
             return
 
-        closes_at = (utc_now() + timedelta(hours=duration)).isoformat()
+        now = utc_now()
+        closes = now + timedelta(minutes=duration or (DEFAULT_ROLE_DURATION if role else DEFAULT_DURATION))
+        remind = poll_cards.reminder_time(now, closes)
         poll_id = await db.add_poll(str(interaction.guild.id), str(interaction.channel.id), question.strip(),
                                     options, str(role.id) if role else None, str(interaction.user.id),
-                                    closes_at, secrets.token_hex(32))
+                                    closes.isoformat(), remind.isoformat() if remind else None,
+                                    secrets.token_hex(32))
         poll = await db.get_poll(poll_id)
         try:
             message = await interaction.channel.send(
@@ -168,7 +178,7 @@ class Polls(commands.Cog):
         if members is None:
             return poll_cards.open_card(poll, len(voters))
         return poll_cards.open_card(poll, len(voters), eligible=len(members),
-                                    voted=len(members) - count_absent(poll, members, voters))
+                                    voted=len(members) - len(absent(poll, members, voters)))
 
     async def vote(self, interaction: discord.Interaction, poll_id: int, choice: int):
         """A member clicked a choice. Who voted is never logged or shown."""
@@ -195,23 +205,50 @@ class Polls(commands.Cog):
         """Close a poll and turn its card into the results. False if it was already closed."""
         guild = self.bot.get_guild(int(poll["guild_id"]))
         members = role_voters(guild, poll) if guild else None
-        absent = None if members is None else count_absent(poll, members, await db.poll_voters(poll["id"]))
-        results = await db.close_poll(poll["id"], absent)
+        missing = None if members is None else len(absent(poll, members, await db.poll_voters(poll["id"])))
+        results = await db.close_poll(poll["id"], missing)
         if results is None:
             return False
         logger.info("Poll #%s closed with %s votes", poll["id"], sum(results))
         channel = self.bot.get_channel(int(poll["channel_id"]))
         try:
             message = await channel.fetch_message(int(poll["message_id"]))
-            await message.edit(embed=poll_cards.closed_card(poll, results, absent), view=None)
+            await message.edit(embed=poll_cards.closed_card(poll, results, missing), view=None)
         except (AttributeError, TypeError, discord.HTTPException) as e:
             logger.info("Couldn't show poll #%s's results on its card: %s", poll["id"], e)
         return True
 
+    async def remind(self, poll: dict) -> bool:
+        """Say once that a poll is about to close: a line in its channel that
+        pings nobody and, for a role's poll, a DM to each member of the role
+        who hasn't voted. Nothing if the whole role has voted."""
+        if not await db.mark_poll_reminded(poll["id"]):
+            return False
+        guild = self.bot.get_guild(int(poll["guild_id"]))
+        members = role_voters(guild, poll) if guild else None
+        waiting = [] if members is None else absent(poll, members, await db.poll_voters(poll["id"]))
+        if members is not None and not waiting:
+            return False
+        url = card_url(poll)
+        channel = self.bot.get_channel(int(poll["channel_id"]))
+        try:
+            await channel.send(poll_cards.channel_reminder(poll, url, len(waiting)),
+                               allowed_mentions=discord.AllowedMentions.none())
+        except (AttributeError, discord.HTTPException) as e:
+            logger.info("Couldn't post poll #%s's reminder: %s", poll["id"], e)
+        for member in waiting:
+            await feed_notices.dm(self.bot, str(member.id), poll_cards.dm_reminder(poll, url))
+        logger.info("Poll #%s reminded that it's closing", poll["id"])
+        return True
+
     @tasks.loop(minutes=1)
     async def close_due(self):
+        """Every minute: send the reminders that are due, close the polls whose time is up."""
         try:
-            for poll in await db.open_polls(due_by=utc_now().isoformat()):
+            now = utc_now().isoformat()
+            for poll in await db.polls_to_remind(now):
+                await self.remind(poll)
+            for poll in await db.open_polls(due_by=now):
                 await self.close_poll(poll)
         except Exception:
             logger.exception("Closing due polls failed")

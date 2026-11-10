@@ -6,11 +6,15 @@
 
 import hashlib
 import hmac
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 
 BAR_WIDTH = 20
+# A poll says it's about to close when a quarter of its time is left, a day
+# before at the earliest. Polls shorter than this get no reminder: the poll
+# itself was posted moments ago.
+REMINDER_SHARE, REMINDER_MAX, REMINDER_MIN_DURATION = 0.25, timedelta(hours=24), timedelta(hours=2)
 ABOUT = (
     "**How this poll is anonymous**\n"
     "• The poll only ever shows totals. Nobody in Discord, moderators included, can see who voted "
@@ -27,6 +31,27 @@ def voter_key(secret: str, user_id: int) -> str:
     one poll (so a second click replaces their vote), meaningless without
     the poll's secret, which is erased when the poll closes."""
     return hmac.new(secret.encode(), str(user_id).encode(), hashlib.sha256).hexdigest()
+
+
+def reminder_time(created: datetime, closes: datetime) -> datetime | None:
+    """When a poll open from `created` to `closes` reminds people, if at all."""
+    duration = closes - created
+    if duration < REMINDER_MIN_DURATION:
+        return None
+    return closes - min(REMINDER_MAX, duration * REMINDER_SHARE)
+
+
+def channel_reminder(poll: dict, url: str, waiting: int | None = None) -> str:
+    """The line in the poll's channel. `waiting` is how many of a role's members haven't voted."""
+    line = f"⏰ [This poll]({url}) closes <t:{closes_timestamp(poll)}:R>: **{poll['question']}**"
+    return line + (f"\n{waiting} of <@&{poll['role_id']}> still to vote." if waiting else "")
+
+
+def dm_reminder(poll: dict, url: str) -> str:
+    """What a role's member who hasn't voted yet is told, privately."""
+    return (f"🗳️ A poll is waiting for your vote and closes <t:{closes_timestamp(poll)}:R>:\n"
+            f"**{poll['question']}**\n{url}\n"
+            "-# Only people who haven't voted get this reminder. Nobody else can see whether you voted.")
 
 
 def closes_timestamp(poll: dict) -> int:
