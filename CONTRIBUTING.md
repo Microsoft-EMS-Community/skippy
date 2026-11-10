@@ -48,6 +48,7 @@ Each feature is its own module, with its own commands and event listeners.
 | Feeds (`/feed`) | `feeds.py` (the commands), `feed_poller.py` (checking feeds), `feed_posting.py`, `feed_roundup.py`, `feed_activity.py` (the activity rule), `feed_registry.py`, `feed_notices.py`, `feed_reader.py` (reading RSS/Atom) |
 | Blogs (`/blog`) | `blog.py` (suggestions, search, profile links), `profile_links.py` |
 | RSS watchlist | `rss_watch.py` |
+| Anonymous polls (`/poll`) | `polls.py` (the commands, buttons and closing on time), `poll_cards.py` (how a poll looks, the scrambled voter code) |
 | `/help`, @mentions, fun | `guide.py`, `mentions.py`, `fun.py` |
 | Shared | `checks.py` (who may use what), `db/` (the SQLite database: one file per area, each creating its own tables; everything is used as `db.<function>`) |
 | Tests | `tests/`; `tests/discord_fakes.py` stands in for Discord |

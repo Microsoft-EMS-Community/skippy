@@ -5,7 +5,7 @@
 # SCHEMA and brings older databases up to date in upgrade().
 # ============================================================
 
-from . import audit, authors, feeds, followups, settings, suggestions, watchlist
+from . import audit, authors, feeds, followups, polls, settings, suggestions, watchlist
 from .audit import add_audit_log, get_recent_audit_log
 from .authors import delete_author_links, get_author_links, get_author_state, set_author_links, set_author_state
 from .connection import DB_PATH, connect
@@ -16,6 +16,8 @@ from .followups import (add_follow_up, get_avg_resolution_time, get_left_server_
                         get_overdue_follow_ups, get_server_stats, get_user_score, increment_flag_count,
                         increment_ignored_count, increment_resolved_count, mark_ignored, mark_left_server,
                         mark_warning_sent, resolve_all_open_follow_ups)
+from .polls import (add_poll, cast_poll_vote, close_poll, delete_poll, get_poll, mark_poll_reminded, open_polls,
+                    poll_voters, polls_to_remind, set_poll_message)
 from .settings import get_setting, set_setting
 from .suggestions import (add_suggestion, decide_suggestion, get_suggestion, pending_suggestions,
                           set_suggestion_message)
@@ -23,7 +25,7 @@ from .watchlist import (add_to_watchlist, cleanup_rss_activity, get_latest_rss_m
                         get_rss_activity_count, get_watch_entry, get_watchlist, is_watched, log_rss_activity,
                         remove_from_watchlist)
 
-AREAS = (followups, audit, watchlist, feeds, suggestions, settings, authors)
+AREAS = (followups, audit, watchlist, feeds, suggestions, settings, authors, polls)
 
 
 async def init_db():

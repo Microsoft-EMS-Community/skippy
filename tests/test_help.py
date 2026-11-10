@@ -73,7 +73,7 @@ class HelpTests(unittest.IsolatedAsyncioTestCase):
     async def test_guide_covers_every_area(self):
         mod_guide = guide.moderator_help()
         names = " ".join(f.name for f in mod_guide.fields)
-        for area in ("Follow-ups", "Feeds", "Blog", "RSS watchlist", "New accounts", "Links", "Fun",
+        for area in ("Follow-ups", "Feeds", "Blog", "Anonymous polls", "RSS watchlist", "New accounts", "Links", "Fun",
                      "Where Skippy reports", "Changing Skippy"):
             self.assertIn(area, names)
         for channel in (FEED_ROUNDUP_CHANNEL_ID, RSS_AUDIT_CHANNEL_ID,
@@ -83,8 +83,9 @@ class HelpTests(unittest.IsolatedAsyncioTestCase):
     async def test_guide_lists_every_slash_command_the_bot_has(self):
         import blog
         import feeds
+        import polls
         groups = {"rsswatch": rss_watch.RssWatch.rsswatch, "feed": feeds.FeedCommands.feed,
-                  "blog": blog.BlogCommands.blog}
+                  "blog": blog.BlogCommands.blog, "poll": polls.Polls.poll}
         names = [c.name for cog in (followup_commands.FollowUpCommands, fun.FunCommands)
                  for c in cog.__cog_app_commands__]
         names += [f"{g} {c.name}" for g, group in groups.items() for c in group.commands]
